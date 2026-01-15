@@ -533,7 +533,7 @@ with st.sidebar:
 
 with st.form("search_form"):
     st.subheader("Filtros de busca")
-    area = st.selectbox("Área (ex.:)", ["Data Science", "Software Engineering", "DevOps", "Security", "Product", "Design", "Sales/Marketing", "Outro"], index=0, key="area_sel")
+    area = st.selectbox("Área (ex.:)", ["Administração", "Contabilidade", "Direito", "Economia", "Engenharia", "Estética", "Humanas", "Licenciatura","Saúde","Tecnologia","Outro"], index=0, key="area_sel")
     competence = st.text_input("Competência / skill (ex.: Python, AWS, Spark)", placeholder="python, aws, spark", key="competence_input")
     location = st.text_input("Localidade (cidade / estado / país)", placeholder="São Paulo, Brazil", key="location_input")
     free_text = st.text_input("Termos adicionais (ex.: 'Bacharel', 'Mestrado', 'Sênior')", placeholder="", key="free_text_input")
@@ -870,4 +870,5 @@ st.markdown("---")
 st.markdown(
     "**Aviso de Privacidade e Uso:** Mesmo sem busca por e-mails, trate nomes e links com responsabilidade (LGPD/GDPR)."
 )
+
 
