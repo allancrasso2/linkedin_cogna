@@ -1,0 +1,486 @@
+# streamlit_thordata_sourcing.py
+# -*- coding: utf-8 -*-
+"""
+Streamlit app: Sourcing · Thordata SERP
+- Busca via Thordata / Scraper API (Google)
+- Normaliza resultados e extrai (heurística) Nomes e Emails dos snippets/descrições
+- Permite "Estruturar JSON" retornado em tabelas (organic, related, metadata)
+- Mostra JSON cru em expander para inspeção
+- Paginação, cache por sessão e export CSV
+
+Alterado: adicionada opção "Somente LinkedIn (perfils)" que prefixa a query com
+(site:linkedin.com/in OR site:linkedin.com/pub) e filtra os resultados retornados.
+Também inclui heurística para extrair nome do campo `title` de perfis LinkedIn.
+Adicionado filtro "Mostrar apenas resultados com e-mails".
+"""
+import os
+import time
+import re
+import json
+from typing import List, Dict, Any, Optional, Tuple
+
+import requests
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Sourcing · Thordata SERP", layout="wide")
+
+# Endpoint Thordata (conforme painel)
+ENDPOINT = "https://scraperapi.thordata.com/request"
+
+# ---------------- Utilities ----------------
+EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+', re.I)
+# NOTE: NAME_RE is a heuristic; for Portuguese names this will find 2-3 word capitalized sequences.
+NAME_RE = re.compile(r'\b([A-ZÀ-Ÿ][a-zà-ÿ]+(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]+){1,2})\b')
+
+def dedupe_list_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for it in items:
+        if it and it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
+
+def find_emails_and_names_in_text(text: str) -> Dict[str, List[str]]:
+    """
+    Procura por e-mails e por candidatos a nome no texto (heurística).
+    Retorna dicionário {"emails": [...], "names": [...]}
+    """
+    if not text:
+        return {"emails": [], "names": []}
+    emails = EMAIL_RE.findall(text)
+    name_candidates = [m.group(1) for m in NAME_RE.finditer(text)]
+    return {
+        "emails": dedupe_list_preserve_order([e.strip() for e in emails]),
+        "names": dedupe_list_preserve_order([n.strip() for n in name_candidates])
+    }
+
+def extract_name_from_linkedin_title(title: Optional[str]) -> Optional[str]:
+    """
+    Heurística para extrair o nome a partir do title retornado pelo Google para perfis LinkedIn.
+    Exemplos de title:
+      "Allan Crasso - Analista | LinkedIn"
+      "Maria Silva | LinkedIn"
+    Retorna: "Allan Crasso" ou "Maria Silva" (ou None)
+    """
+    if not title:
+        return None
+    # cortar após pipe '|' (ex: "Nome - Cargo | LinkedIn")
+    primary = title.split("|")[0]
+    # cortar por " - " ou " — " se houver (para remover cargo)
+    primary = primary.split(" - ")[0].split(" — ")[0]
+    primary = primary.strip()
+    if len(primary) >= 1:
+        return primary
+    return None
+
+# ---------------- HTTP + Backoff ----------------
+def exponential_backoff_sleep(attempt: int):
+    wait = min(30, 2 ** attempt)
+    time.sleep(wait)
+
+def thordata_search(token: str,
+                    q: str,
+                    engine: str = "google",
+                    domain: Optional[str] = None,
+                    gl: Optional[str] = None,
+                    hl: Optional[str] = None,
+                    start: Optional[int] = None,
+                    num: Optional[int] = None,
+                    render_js: bool = False,
+                    extra_params: Optional[Dict[str, Any]] = None,
+                    max_retries: int = 6) -> Any:
+    """
+    Executa POST para a Thordata / Scraper API.
+    Retorna o JSON (ou texto bruto caso o parse falhe).
+    Trata 429 com backoff e erros 401/402 com exceção amigável.
+    """
+    if not token:
+        raise RuntimeError("Token não informado. Defina THORDATA_TOKEN no ambiente ou cole na UI.")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {"engine": engine, "q": q, "json": "1"}
+    if domain: data["domain"] = domain
+    if gl: data["gl"] = gl
+    if hl: data["hl"] = hl
+    if start is not None: data["start"] = str(start)
+    if num is not None: data["num"] = str(num)
+    if render_js: data["render_js"] = "1"
+    if extra_params:
+        for k, v in extra_params.items():
+            if v is not None:
+                data[k] = str(v)
+
+    attempt = 0
+    while True:
+        resp = requests.post(ENDPOINT, headers=headers, data=data, timeout=60)
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except ValueError:
+                return resp.text
+        if resp.status_code == 429:
+            if attempt >= max_retries:
+                raise RuntimeError("Rate limited: excedeu tentativas (429).")
+            exponential_backoff_sleep(attempt)
+            attempt += 1
+            continue
+        if resp.status_code == 401:
+            raise RuntimeError("401 Unauthorized - token inválido ou expirado.")
+        if resp.status_code == 402:
+            raise RuntimeError("402 Payment Required - saldo insuficiente.")
+        resp.raise_for_status()
+
+# ---------------- Result extraction (heurística) ----------------
+def extract_and_enrich(serp_json: Any) -> List[Dict[str, Any]]:
+    """
+    Extrai uma lista plana de registros heurísticos a partir do JSON retornado pela API.
+    Campos produzidos: title, link, snippet, displayed_link, emails, names
+    """
+    out = []
+    if isinstance(serp_json, dict):
+        # try several likely keys
+        for key in ("organic_results", "organic", "results", "items"):
+            items = serp_json.get(key)
+            if isinstance(items, list) and items:
+                for it in items:
+                    snippet = (it.get("snippet") or it.get("description") or "") if isinstance(it, dict) else ""
+                    found = find_emails_and_names_in_text(snippet)
+                    out.append({
+                        "title": it.get("title"),
+                        "link": it.get("link") or it.get("url") or it.get("source_url"),
+                        "snippet": snippet,
+                        "displayed_link": it.get("displayed_link") or it.get("display_link"),
+                        "emails": ",".join(found["emails"]),
+                        "names": ",".join(found["names"])
+                    })
+                return out
+        # TheirStack / Thordata style: data -> list
+        if "data" in serp_json and isinstance(serp_json["data"], list):
+            for it in serp_json["data"]:
+                snippet = (it.get("description") or "") if isinstance(it, dict) else ""
+                found = find_emails_and_names_in_text(snippet)
+                out.append({
+                    "title": it.get("job_title") or it.get("title"),
+                    "link": it.get("source_url") or it.get("final_url") or it.get("url"),
+                    "snippet": snippet,
+                    "company": (it.get("company_object") or {}).get("name"),
+                    "emails": ",".join(found["emails"]),
+                    "names": ",".join(found["names"])
+                })
+            return out
+    if isinstance(serp_json, str):
+        found = find_emails_and_names_in_text(serp_json)
+        out.append({
+            "title": "No structured results - raw response",
+            "link": None,
+            "snippet": (serp_json[:1000] + "...") if len(serp_json) > 1000 else serp_json,
+            "emails": ",".join(found["emails"]),
+            "names": ",".join(found["names"])
+        })
+        return out
+    out.append({
+        "title": "No structured results - raw response (object)",
+        "link": None,
+        "snippet": json.dumps(serp_json, ensure_ascii=False)[:1000],
+        "emails": "",
+        "names": ""
+    })
+    return out
+
+# ---------------- JSON structuring utility ----------------
+def structure_response_json(resp_obj: Any) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """
+    Recebe resp_obj (resultado bruto da API) e retorna:
+    - df_organic: DataFrame com registros 'organic' (flattened)
+    - df_related: DataFrame com itens de 'related'
+    - metadata: dict com search_metadata, spider_parameter, search_information
+    """
+    # metadata extract
+    metadata = {}
+    if isinstance(resp_obj, dict):
+        metadata['search_metadata'] = resp_obj.get("search_metadata", {})
+        metadata['spider_parameter'] = resp_obj.get("spider_parameter", {})
+        metadata['search_information'] = resp_obj.get("search_information", {})
+    else:
+        metadata['raw'] = str(resp_obj)
+
+    # organic -> DataFrame
+    organic_list = []
+    if isinstance(resp_obj, dict):
+        for key in ("organic", "organic_results", "results", "items"):
+            candidate = resp_obj.get(key)
+            if isinstance(candidate, list):
+                for it in candidate:
+                    # Normalize fields that typically exist in sample
+                    item = {
+                        "title": it.get("title"),
+                        "position": it.get("position"),
+                        "display_link": it.get("display_link") or it.get("displayed_link"),
+                        "source": it.get("source"),
+                        "favicon": it.get("favicon"),
+                        "link": it.get("link") or it.get("url") or it.get("source_url"),
+                        "description": it.get("description") or it.get("snippet") or "",
+                        "image_base64": it.get("image_base64") or it.get("image") or None
+                    }
+                    organic_list.append(item)
+                break
+    df_organic = pd.DataFrame(organic_list)
+
+    # related -> DataFrame
+    related_list = []
+    if isinstance(resp_obj, dict) and isinstance(resp_obj.get("related"), list):
+        for it in resp_obj.get("related", []):
+            related_list.append({
+                "text": it.get("text") or it.get("title") or "",
+                "link": it.get("link") or ""
+            })
+    df_related = pd.DataFrame(related_list)
+
+    return df_organic, df_related, metadata
+
+# ---------------- Streamlit UI ----------------
+st.title("🔎 Sourcing · Thordata SERP (Google) — Estruturar JSON")
+st.markdown("O app agora tem um botão 'Estruturar JSON' que transforma o JSON cru em tabelas (organic, related, metadata). Use com cuidado (LGPD).")
+
+with st.sidebar:
+    st.header("Configuração da API")
+    env_token = os.getenv("THORDATA_TOKEN", "")
+    api_token = st.text_input("TheirData API Key (Bearer)", value=env_token, type="password",
+                              help="Recomendado: defina THORDATA_TOKEN no ambiente.")
+    st.markdown("---")
+    st.header("Parâmetros padrão")
+    engine = st.selectbox("Mecanismo", options=["google", "bing"], index=0)
+    domain = st.selectbox("Domínio Google", options=["google.com", "google.com.br", "google.co.uk"], index=0)
+    gl = st.selectbox("País (gl)", options=["BR", "US", "CA", "UK", ""], index=0)
+    hl = st.selectbox("Idioma (hl)", options=["pt-BR", "en", "pt", ""], index=0)
+    render_js = st.checkbox("Renderizar JS (mais lento/custoso)", value=False)
+    st.markdown("---")
+    st.checkbox("Extrair nomes e e-mails automaticamente", value=True, key="do_extract")
+    st.markdown("📌 Monitoramento")
+    st.write("Verifique seu painel Thordata para saldo/quota antes de rodar batches.")
+
+# Main form
+with st.form("search_form"):
+    st.subheader("Filtros de busca")
+    area = st.selectbox("Área (ex.:)", ["Data Science", "Software Engineering", "DevOps", "Security", "Product", "Design", "Sales/Marketing", "Outro"], index=0)
+    competence = st.text_input("Competência / skill (ex.: Python, AWS, Spark)", placeholder="python, aws, spark")
+    location = st.text_input("Localidade (cidade / estado / país)", placeholder="São Paulo, Brazil")
+    free_text = st.text_input("Termos adicionais (ex.: 'Bacharel', 'Mestrado', 'Sênior')", placeholder="")
+    linkedin_only = st.checkbox("Somente LinkedIn (perfils) — site:linkedin.com/in", value=False,
+                                help="Se marcado, a consulta será prefixada com site:linkedin.com/in OR site:linkedin.com/pub e os resultados serão filtrados.")
+    per_page = st.slider("Resultados por página", min_value=5, max_value=50, value=10, step=5)
+    page_idx = st.number_input("Página (0 = primeira)", min_value=0, value=0, step=1)
+    show_raw_json = st.checkbox("Mostrar JSON cru (expander) após consulta", value=False)
+    submitted = st.form_submit_button("🔎 Pesquisar")
+
+# session cache init
+if "cache" not in st.session_state:
+    st.session_state["cache"] = {}
+# store last raw response and results for the struct button
+if "last_resp" not in st.session_state:
+    st.session_state["last_resp"] = None
+if "last_results" not in st.session_state:
+    st.session_state["last_results"] = []
+
+def is_linkedin_link(link: Optional[str]) -> bool:
+    if not link:
+        return False
+    lower = link.lower()
+    return ("linkedin.com/in" in lower) or ("linkedin.com/pub" in lower) or ("br.linkedin.com/in" in lower)
+
+# Execute search when form is submitted
+if submitted:
+    token_to_use = api_token.strip() or os.getenv("THORDATA_TOKEN", "").strip()
+    if not token_to_use:
+        st.error("Token não fornecido. Defina THORDATA_TOKEN no ambiente ou cole a chave no campo da lateral.")
+    else:
+        parts = []
+        if area and area != "Outro": parts.append(area)
+        if competence: parts.append(competence)
+        if location: parts.append(location)
+        if free_text: parts.append(free_text)
+        q = " ".join([p for p in parts if p]).strip()
+
+        # If user wants only LinkedIn, prefix the query to bias results to linkedin profiles
+        if linkedin_only:
+            if q:
+                q = f"(site:linkedin.com/in OR site:linkedin.com/pub) {q}"
+            else:
+                # if no other terms provided, still search for generic linkedin profiles (not ideal but allowed)
+                q = "(site:linkedin.com/in OR site:linkedin.com/pub)"
+
+        if q == "":
+            st.warning("Query vazia — informe ao menos uma competência, área ou localidade.")
+        else:
+            st.caption("Sugestão: para perfis LinkedIn, marcando 'Somente LinkedIn' a query será ajustada. Se estiver sem resultados, experimente ativar 'Renderizar JS'.")
+            start = page_idx * per_page
+            cache_key = f"{q}|{engine}|{domain}|{gl}|{hl}|{start}|{per_page}|{render_js}|linked:{int(linkedin_only)}"
+            if cache_key in st.session_state["cache"]:
+                st.success("Resultados carregados do cache local.")
+                resp_obj = st.session_state["cache"][cache_key]["resp"]
+                results = st.session_state["cache"][cache_key]["results"]
+            else:
+                with st.spinner("Consultando Thordata (SERP)..."):
+                    try:
+                        resp_obj = thordata_search(token=token_to_use, q=q, engine=engine,
+                                                  domain=domain, gl=(gl or None), hl=(hl or None),
+                                                  start=start, num=per_page, render_js=render_js)
+                    except Exception as e:
+                        st.error(f"Erro na busca: {e}")
+                        resp_obj = None
+                        results = []
+                    else:
+                        results = extract_and_enrich(resp_obj)
+
+                        # If linkedin_only: filter results by link or snippet containing linkedin
+                        if linkedin_only:
+                            filtered = [r for r in results if is_linkedin_link(r.get("link"))]
+                            if not filtered:
+                                # fallback: some results include linkedin in snippet/displayed_link but not in link field
+                                filtered = [r for r in results if ("linkedin.com/in" in (r.get("snippet") or "").lower()) or ("linkedin.com/pub" in (r.get("snippet") or "").lower())]
+                            results = filtered
+
+                        # Enriquecer nomes para perfis LinkedIn usando o título (se aplicável)
+                        for r in results:
+                            link = r.get("link") or ""
+                            title = r.get("title") or ""
+                            if is_linkedin_link(link):
+                                linkedin_name = extract_name_from_linkedin_title(title)
+                                if linkedin_name:
+                                    existing = (r.get("names") or "")
+                                    if existing:
+                                        parts_names = [x.strip() for x in existing.split(",") if x.strip()]
+                                        if linkedin_name not in parts_names:
+                                            r["names"] = ",".join([linkedin_name] + parts_names)
+                                    else:
+                                        r["names"] = linkedin_name
+
+                        st.session_state["cache"][cache_key] = {"resp": resp_obj, "results": results}
+
+            # store last response/results in session_state for use by the button (persist across reruns)
+            st.session_state["last_resp"] = resp_obj
+            st.session_state["last_results"] = results
+
+            # show results table (heuristic extraction)
+            if results:
+                df = pd.DataFrame(results)
+                if "snippet" in df.columns:
+                    df["snippet"] = df["snippet"].astype(str).str.replace("\n", " ").str.slice(0, 500)
+
+                # checkbox to show only results with names (heurística)
+                show_only_with_names = st.checkbox("Mostrar apenas resultados com nomes", value=False, key="filter_names_checkbox")
+                # checkbox to show only results with emails (heurística)
+                show_only_with_emails = st.checkbox("Mostrar apenas resultados com e-mails", value=False, key="filter_emails_checkbox")
+
+                df_display = df.copy()
+                if show_only_with_names and "names" in df_display.columns:
+                    df_display = df_display[df_display["names"].astype(str).str.strip() != ""]
+                if show_only_with_emails and "emails" in df_display.columns:
+                    df_display = df_display[df_display["emails"].astype(str).str.strip() != ""]
+
+                st.markdown(f"**Resultados (página {page_idx}) — {len(df_display)} itens**")
+                st.dataframe(df_display.rename(columns={"emails": "emails (heur.)", "names": "names (heur.)"}))
+                csv = df_display.to_csv(index=False).encode("utf-8")
+                st.download_button(⬇️ Exportar CSV (heur.)", csv, file_name="sourcing_results_heur.csv", mime="text/csv")
+
+                st.markdown("### Links (clique para abrir)")
+                for r in df_display.to_dict(orient="records"):
+                    title = r.get("title") or "(no title)"
+                    link = r.get("link") or ""
+                    snippet = (r.get("snippet") or "")[:200]
+                    emails = r.get("emails") or ""
+                    names = r.get("names") or ""
+                    badge = ""
+                    if emails: badge += f" ✉️ {emails}"
+                    if names: badge += f" 👤 {names}"
+                    if link:
+                        st.write(f"- [{title}]({link}) — {snippet} {badge}")
+                    else:
+                        st.write(f"- {title} — {snippet} {badge}")
+            else:
+                st.info("Nenhum resultado estruturado retornado para a consulta.")
+
+# ----- Estruturar JSON: fora do bloco 'submitted' para funcionar ao clicar -----
+st.markdown("---")
+st.markdown("### 📦 Estruturar JSON retornado (usa último resultado em cache)")
+
+# Botão global para estruturar JSON (usa st.session_state["last_resp"])
+if st.button("🔧 Estruturar JSON", key="struct_button_global"):
+    resp_obj = st.session_state.get("last_resp")
+    if resp_obj is None:
+        st.error("Não há resposta em cache. Execute uma busca primeiro (botão '🔎 Pesquisar').")
+    else:
+        with st.spinner("Estruturando JSON..."):
+            try:
+                df_organic, df_related, metadata = structure_response_json(resp_obj)
+            except Exception as e:
+                st.error(f"Erro ao estruturar JSON: {e}")
+                df_organic = pd.DataFrame()
+                df_related = pd.DataFrame()
+                metadata = {}
+
+        st.success("JSON estruturado com sucesso.")
+        # show metadata summary
+        st.subheader("Metadata (resumo)")
+        try:
+            st.json({k: (metadata[k] if len(str(metadata[k])) < 2000 else " (conteúdo truncado) ") for k in metadata})
+        except Exception:
+            st.write(metadata)
+
+        # show organic table
+        if not df_organic.empty:
+            st.subheader(f"Organic — {len(df_organic)} registros")
+            # truncate long description
+            df_organic_display = df_organic.copy()
+            if "description" in df_organic_display.columns:
+                df_organic_display["description"] = df_organic_display["description"].astype(str).str.replace("\n", " ").str.slice(0, 500)
+            st.dataframe(df_organic_display)
+            csv_organic = df_organic.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Exportar CSV (organic)", csv_organic, file_name="sourcing_organic.csv", mime="text/csv")
+            # show list with clickable links
+            st.markdown("### Organic — Links")
+            for idx, row in df_organic.iterrows():
+                title = row.get("title") or "(no title)"
+                link = row.get("link") or ""
+                desc = (row.get("description") or "")[:200]
+                source = row.get("source") or ""
+                if link:
+                    st.write(f"- [{title}]({link}) — {source} — {desc}")
+                else:
+                    st.write(f"- {title} — {source} — {desc}")
+        else:
+            st.info("Nenhum registro 'organic' encontrado no JSON.")
+
+        # show related
+        if not df_related.empty:
+            st.subheader(f"Related — {len(df_related)} itens")
+            st.dataframe(df_related)
+            csv_related = df_related.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Exportar CSV (related)", csv_related, file_name="sourcing_related.csv", mime="text/csv")
+        else:
+            st.info("Nenhum item 'related' encontrado no JSON.")
+
+# show raw json if requested (usa last_resp)
+if st.checkbox("Mostrar JSON cru (última resposta em cache)", value=False, key="show_raw_cache"):
+    resp_obj = st.session_state.get("last_resp")
+    if resp_obj is None:
+        st.info("Sem resposta em cache para exibir.")
+    else:
+        with st.expander("🔧 JSON cru (data retornada pela API) — expandir para inspecionar"):
+            try:
+                pretty = json.dumps(resp_obj, ensure_ascii=False, indent=2)
+            except Exception:
+                pretty = str(resp_obj)
+            st.code(pretty[:20000], language="json")
+
+# ---------------- Footer / Avisos ----------------
+st.markdown("---")
+st.markdown(
+    "**Aviso de Privacidade e Uso:** Coleta e tratamento de e-mails e nomes tem implicações legais (LGPD/GDPR). "
+    "Use estes dados apenas sob base legal apropriada, armazene com segurança e permita remoção. "
+    "Evite scraping massivo do LinkedIn; prefira ferramentas/licenciamento oficiais quando aplicável."
+)

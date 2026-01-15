@@ -1,0 +1,771 @@
+# app_menu.py
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import io
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Tuple, Optional
+
+import pandas as pd
+import streamlit as st
+
+# se estiver usando o módulo novo:
+from cadastro_disciplina import cadastrar_disciplina, DEFAULT_DB, DEFAULT_ROOT
+
+st.set_page_config(page_title="Automação de Entregas", layout="wide")
+DB_PATH = Path(DEFAULT_DB)
+ABS_DB = DB_PATH.resolve()
+
+st.title("🗂️ Automação de Entregas")
+st.caption(f"Banco de dados: `{ABS_DB}`")
+
+# ------------------ conexão única ------------------
+@st.cache_resource
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+# ========================= Helpers gerais =========================
+def _norm_u(s: object) -> Optional[str]:
+    s2 = str(s).upper().strip()
+    m = re.search(r"U\s*0*(\d+)", s2) or re.search(r"UNIDADE\s*0*(\d+)", s2) or re.fullmatch(r"0*(\d+)", s2)
+    return f"U{int(m.group(1))}" if m else None
+
+def _extract_aula_from_name(nome: str):
+    s = str(nome)
+    m = re.search(r"U\s*0*(\d+)\s*A\s*0*(\d{1,2})(?!\d)", s, flags=re.IGNORECASE)
+    if m:
+        a = int(m.group(2))
+        return f"A{a:02d}"
+    if re.search(r"U\s*0*\d+\s*(?:A\s*)?(?:ENC(?:ERRAMENTO)?)\b", s, flags=re.IGNORECASE):
+        return "AEnc"
+    if re.search(r"U\s*0*\d+\s*D[êe]\s*o\s*Play", s, flags=re.IGNORECASE):
+        return "APlay"
+    return None
+
+def _norm_aula(s: object) -> Optional[str]:
+    if s is None: return None
+    txt = str(s).strip()
+    if not txt: return None
+    up = txt.upper()
+    m = re.fullmatch(r"A?\s*0*(\d{1,2})", up)
+    if m:
+        return f"A{int(m.group(1)):02d}"
+    if re.search(r"(?:^|[^A-Z])A?\s*ENC(?:ERRAMENTO)?", up):
+        return "AEnc"
+    if re.search(r"D[ÊE]\s*O\s*PLAY|DE O PLAY|DÊ O PLAY", up):
+        return "APlay"
+    return None
+
+def _aula_sort_key(val: str):
+    if isinstance(val, str) and val.upper().startswith("A"):
+        up = val.upper()
+        if len(up) >= 3 and up[1:3].isdigit():
+            return int(up[1:3])
+        if up == "APLAY": return 998
+        if up == "AENC":  return 999
+    return 1000
+
+_BEG = r"(?<![A-Za-z0-9])"; _END = r"(?![A-Za-z0-9])"
+# Ajuste: incluí APROVAD[...] para detectar "Aprovado/Aprovada/Aprovados"
+_rx_validada = re.compile(
+    rf"{_BEG}(?:VALIDAD[AO]S?|VALIDA(?:C(?:AO|ÃO))|APROVAD[AO]S?|APROVA(?:C(?:AO|ÃO))){_END}",
+    re.IGNORECASE,
+)
+_rx_aj = re.compile(rf"{_BEG}A[Jj]\s*[-_. ]*\s*0*(\d+){_END}", re.IGNORECASE)
+_rx_rev = re.compile(
+    rf"(?:{_BEG}RE[Vv]\s*[-_. ]*\s*0*(\d+){_END})|(?:{_BEG}REVIS(?:AO|ÃO)\s*[-_. ]*\s*0*(\d+){_END})",
+    re.IGNORECASE,
+)
+_rx_entrega = re.compile(rf"{_BEG}ENTREGA{_END}", re.IGNORECASE)
+
+def _infer_status(nome: str) -> Tuple[str, tuple]:
+    base = Path(nome).stem
+    # "Validada" / "Aprovado" -> exibimos como "Aprovada"
+    if _rx_validada.search(base):
+        return ("Aprovada", (0,0))
+    m_aj = _rx_aj.search(base)
+    if m_aj:
+        return (f"AJ{int(m_aj.group(1))}", (1, -int(m_aj.group(1))))
+    m_rev = _rx_rev.search(base)
+    if m_rev:
+        g = m_rev.group(1) or m_rev.group(2)
+        return (f"REV {int(g)}", (2, -int(g)))
+    if _rx_entrega.search(base):
+        return ("Entrega", (3,0))
+    return ("—", (4,0))
+
+def pick_latest(series: pd.Series) -> Optional[pd.Timestamp]:
+    s = pd.to_datetime(series, errors="coerce").dropna()
+    return s.max() if not s.empty else None
+
+def _human_delta(total_seconds: Optional[float]) -> str:
+    if total_seconds is None:
+        return ""
+    s = int(total_seconds)
+    negative = s < 0
+    if negative:
+        s = abs(s)
+    days, rem = divmod(s, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    text = " ".join(parts) if parts else "0h"
+    return ("-" + text) if negative else text
+
+def semaforo(now: datetime, due: Optional[datetime], delivered: Optional[datetime]) -> tuple[str,str]:
+    if due is None: return ("•","sem prazo")
+    if delivered is not None:
+        return ("🟢","entregue no prazo") if delivered <= due else ("🔴","entregue com atraso")
+    delta = (due - now).total_seconds()
+    if delta > 24*3600:
+        return ("🟢", f"no prazo (faltam {int(delta//3600)}h)")
+    if 0 < delta <= 24*3600:
+        return ("🟡", f"faltam {int(delta//3600)}h")
+    return ("🔴","em atraso")
+
+# ------------------ leitura base ------------------
+@st.cache_data(show_spinner=False)
+def load_df() -> pd.DataFrame:
+    conn = get_conn()
+    # mantemos leitura de data_entrega (usada para "Recebido ENT") e prazo_entrega que o usuário preencherá
+    df = pd.read_sql_query(
+        "SELECT rowid AS _id, disciplina, unidade, entrega, data_entrega, prazo_entrega, status_file FROM entregas",
+        conn
+    )
+    # normalizar/parse de datas
+    df["data"] = pd.to_datetime(df.get("data_entrega"), errors="coerce")
+    if "prazo_entrega" in df.columns:
+        df["prazo_entrega"] = pd.to_datetime(df["prazo_entrega"], errors="coerce")
+    else:
+        df["prazo_entrega"] = pd.NaT
+    # unidade normalizada
+    df["unidade"] = df["unidade"].apply(_norm_u)
+
+    # evitar KeyError: se a coluna 'aula' não existir, criar a partir da inferência
+    inferred = df["entrega"].astype(str).apply(_extract_aula_from_name)
+    if "aula" in df.columns:
+        # se houver coluna aula, preenche somente os NAs com a inferência
+        df["aula"] = df["aula"].where(pd.notna(df["aula"]), other=inferred)
+    else:
+        df["aula"] = inferred
+
+    # garantir coluna status_file presente
+    if "status_file" not in df.columns:
+        df["status_file"] = ""
+    return df
+
+# --------- controle de "novos" por sessão ----------
+def tag_new_records(df: pd.DataFrame) -> pd.DataFrame:
+    if "_id" not in df.columns:
+        return df.assign(_is_new=False, Novo="")
+    if "known_ids" not in st.session_state:
+        st.session_state.known_ids = set(df["_id"].tolist())
+        is_new = pd.Series(False, index=df.index)
+    else:
+        current = set(df["_id"].tolist())
+        new_ids = current - st.session_state.known_ids
+        is_new = df["_id"].isin(new_ids)
+        st.session_state.known_ids |= current
+    return df.assign(_is_new=is_new, Novo=is_new.map({True: "🆕", False: ""}))
+
+def mark_all_seen(df: pd.DataFrame):
+    if "_id" in df.columns:
+        st.session_state.known_ids = set(df["_id"].tolist())
+
+# ========================= MENU =========================
+menu = st.sidebar.radio("Menu", ["Cadastrar Disciplina", "Dashboard"], index=0)
+
+# ========== CADASTRAR DISCIPLINA ==========
+if menu == "Cadastrar Disciplina":
+    st.header("🆕 Cadastrar Disciplina (varrer pasta e inserir no banco)")
+    st.caption("Sem duplicar: usa chave normalizada (disciplina/unidade/arquivo). Atualiza a data se vier mais recente.")
+
+    c1, c2 = st.columns([2, 1])
+    disciplina = c1.text_input("Disciplina", placeholder="Ex.: Redes Convergentes")
+    root_dir = st.text_input("Pasta raiz", value=str(DEFAULT_ROOT or ""), help="PASTA_LOCAL_RAIZ do .env")
+    db_path = st.text_input("Caminho do DB", value=str(DEFAULT_DB))
+
+    if st.button("▶️ Processar e cadastrar"):
+        try:
+            resumo = cadastrar_disciplina(disciplina, root_dir, db_path)
+            st.success("Cadastro concluído.")
+            st.json(resumo)
+            load_df.clear()
+        except Exception as e:
+            st.error(f"Falha no cadastro: {e}")
+
+# ========== DASHBOARD ==========
+if menu == "Dashboard":
+    st.header("📊 Dashboard")
+
+    # MIGRATIONS: garantir colunas necessárias (silencioso)
+    conn = get_conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cronograma (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            disciplina TEXT NOT NULL,
+            unidade    TEXT NOT NULL,
+            aula       TEXT NOT NULL,
+            entrega_prevista TEXT NOT NULL,
+            UNIQUE(disciplina, unidade, aula)
+        )
+        """
+    )
+    conn.commit()
+
+    # adicionar coluna prazo_entrega em entregas se não existir (silencioso)
+    try:
+        conn.execute("ALTER TABLE entregas ADD COLUMN prazo_entrega TEXT")
+        conn.commit()
+    except Exception:
+        pass
+
+    # adicionar coluna status_file em entregas se não existir (silencioso)
+    try:
+        conn.execute("ALTER TABLE entregas ADD COLUMN status_file TEXT")
+        conn.commit()
+    except Exception:
+        pass
+
+    df = load_df()
+    if df.empty:
+        st.info("Banco sem registros.")
+        st.stop()
+
+    # novidades
+    with st.sidebar:
+        st.markdown("### 🔔 Novidades")
+        only_new = st.checkbox("Mostrar apenas novos", value=False)
+        if st.button("Marcar todos como vistos"):
+            mark_all_seen(df)
+            st.success("Todos marcados como vistos. Recarregue a lista abaixo.")
+
+    # filtros
+    st.subheader("📚 Pesquisa")
+    with st.sidebar:
+        st.markdown("### Filtros do Dashboard")
+        q = st.text_input("Disciplina (contém)", "")
+
+        unid_opts = sorted(df["unidade"].dropna().unique().tolist(), key=lambda u: int(re.sub(r"\D", "", u) or 0))
+        sel_u = st.selectbox("Unidade", ["Todas"] + unid_opts, index=0)
+
+        base = df if sel_u == "Todas" else df[df["unidade"] == sel_u]
+
+        # Montar opções de "aula" unindo: coluna normalizada + inferência a partir do nome do arquivo
+        existing = [a for a in base["aula"].dropna().unique().tolist()]
+
+        # inferências a partir do nome do arquivo usando a função existente
+        inferred_from_name = pd.Series(base["entrega"].astype(str).apply(lambda n: _extract_aula_from_name(n))).dropna().unique().tolist()
+
+        # detectar manualmente a palavra "encerramento" em nomes que o regex pode não ter capturado
+        inferred_enc = pd.Series(base["entrega"].astype(str).apply(lambda n: "AEnc" if re.search(r"encerramento", str(n), flags=re.IGNORECASE) else None)).dropna().unique().tolist()
+
+        # combinar e ordenar com a chave de ordenação existente
+        combined = sorted(set(existing) | set(inferred_from_name) | set(inferred_enc))
+        aula_opts = sorted(list(combined), key=_aula_sort_key)
+
+        # mostrar selectbox, mas com rótulos amigáveis (ex.: AEnc → "Encerramento")
+        display_map = {"AEnc": "Encerramento", "APlay": "Dê o Play"}
+        sel_a = st.selectbox(
+            "Aula",
+            ["Todas"] + aula_opts,
+            index=0,
+            format_func=lambda x: "Todas" if x == "Todas" else display_map.get(x, x)
+        )
+
+        ord_by = st.radio("Ordenar por", ["Data desc", "Unidade/Aula"], horizontal=True)
+
+    def apply_filters(_df: pd.DataFrame) -> pd.DataFrame:
+        out = _df
+        if q:
+            out = out[out["disciplina"].str.contains(q, case=False, na=False)]
+        if sel_u != "Todas":
+            out = out[out["unidade"] == sel_u]
+        if sel_a != "Todas":
+            # Quando filtrar por aula:
+            #  - incluir linhas onde a coluna aula == sel_a
+            #  - OU onde o nome do arquivo contenha 'encerramento' (casos não capturados)
+            #  - OU onde o nome do arquivo contenha 'quest' (Questões/Questoes/Questão)
+            pattern_quest = r"quest(o|ã|ões|oes|ões|oes)?"
+            mask_aula = out["aula"] == sel_a
+            mask_enc = out["entrega"].astype(str).str.contains(r"encerramento", case=False, na=False)
+            mask_quest = out["entrega"].astype(str).str.contains(pattern_quest, flags=re.IGNORECASE, na=False)
+            out = out[mask_aula | mask_enc | mask_quest]
+        if ord_by == "Data desc":
+            out = out.sort_values(by=["data"], ascending=False, na_position='last')
+        else:
+            # ordenar apenas por colunas que existem
+            order_cols = [c for c in ["unidade", "aula", "data"] if c in out.columns]
+            if order_cols:
+                out = out.sort_values(by=order_cols, ascending=[True]*len(order_cols), na_position='last')
+        return out
+
+    filtrado = apply_filters(df)
+    filtrado = tag_new_records(filtrado)
+    if only_new:
+        filtrado = filtrado[filtrado["_is_new"]]
+
+    # proteger contra colunas duplicadas (evita ValueError shown previously)
+    filtrado = filtrado.loc[:, ~filtrado.columns.duplicated()]
+
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    c1.metric("Registros", len(filtrado))
+    c2.metric("Disciplinas", filtrado["disciplina"].nunique())
+    c3.metric("Unidades", filtrado["unidade"].nunique())
+    c4.metric("Aulas", filtrado["aula"].nunique())
+
+    # REMOVIDO: data_entrega e status_file da exibição
+    cols_show = ["Novo", "disciplina", "unidade", "aula", "entrega", "prazo_entrega"]
+    cols_show = [c for c in cols_show if c in filtrado.columns]
+    st.dataframe(
+        filtrado[cols_show].reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    # downloads (incluir prazo_entrega) -- REMOVIDO data_entrega / status_file
+    export_cols = ["disciplina", "unidade", "aula", "entrega", "prazo_entrega"]
+    export_cols = [c for c in export_cols if c in filtrado.columns]
+    csv = (
+        filtrado[export_cols]
+        .to_csv(index=False)
+        .encode("utf-8")
+    )
+    st.download_button("⬇️ Baixar CSV", csv, "entregas_filtrado.csv", "text/csv")
+
+    try:
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as wr:
+            filtrado[export_cols].to_excel(
+                wr, sheet_name="Consulta", index=False
+            )
+        st.download_button(
+            "⬇️ Baixar XLSX",
+            output.getvalue(),
+            "entregas_filtrado.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    except Exception:
+        pass
+
+    st.markdown("---")
+
+    # ===================== CRONOGRAMA =====================
+    # cronograma já criado acima
+
+    with st.expander("➕ Cadastrar 1 prazo manualmente"):
+        disc_opts = sorted(df["disciplina"].dropna().unique().tolist())
+        sel_disc = st.selectbox("Disciplina", disc_opts, index=0 if disc_opts else None)
+        base_disc = df if not sel_disc else df[ df["disciplina"] == sel_disc ]
+
+        unid_opts_cg = sorted(base_disc["unidade"].dropna().unique().tolist(), key=lambda u: int(re.sub(r"\D","",u) or 0))
+        sel_unid_cg = st.selectbox("Unidade", unid_opts_cg, index=0 if unid_opts_cg else 0)
+
+        aula_opts_cg = sorted(base_disc[base_disc["unidade"]==sel_unid_cg]["aula"].dropna().unique().tolist(), key=_aula_sort_key)
+        sel_aula_cg = st.selectbox("Aula", aula_opts_cg, index=0 if aula_opts_cg else 0)
+
+        cold, colh = st.columns(2)
+        now = datetime.now().replace(second=0, microsecond=0)
+        d = cold.date_input("Data prevista", value=now.date())
+        t = colh.time_input("Hora prevista", value=now.time())
+
+        if st.button("💾 Salvar/Atualizar"):
+            entrega_prev = datetime.combine(d, t).strftime("%Y-%m-%d %H:%M")
+            conn.execute(
+                """
+                INSERT INTO cronograma (disciplina, unidade, aula, entrega_prevista)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(disciplina, unidade, aula)
+                DO UPDATE SET entrega_prevista=excluded.entrega_prevista
+                """,
+                (sel_disc, sel_unid_cg, sel_aula_cg, entrega_prev),
+            )
+            conn.commit()
+            st.success(f"Cronograma salvo para {sel_disc} / {sel_unid_cg} / {sel_aula_cg}: {entrega_prev}")
+
+    with st.expander("📥 Importar cronograma (XLSX/CSV)"):
+        st.markdown(
+            """
+**Formato aceito (qualquer um):**
+- Colunas: `disciplina`, `unidade`, `aula`, `entrega_prevista` (YYYY-MM-DD HH:MM)  
+- **OU** colunas: `disciplina`, `unidade`, `aula`, `data`, `hora`  
+Obs.: `unidade` aceita `U1`, `1`, `Unidade 1`. `aula` aceita `A01`, `1`, `Encerramento`, `AEnc`, `Dê o Play`.
+            """
+        )
+        up = st.file_uploader("Selecione um arquivo XLSX ou CSV", type=["xlsx", "csv"])
+        if up is not None:
+            try:
+                tmp = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
+            except Exception as e:
+                st.error(f"Falha ao ler arquivo: {e}")
+                tmp = None
+
+            def infer_disciplina_from_filename(name: str) -> Optional[str]:
+                base = Path(name).stem
+                m = re.search(r"CRONOGRAMA[_\-\s]+(.+?)[_\-\s]", base, flags=re.IGNORECASE)
+                if m:
+                    return m.group(1).replace("_", " ").strip().title()
+                return None
+
+            if tmp is not None:
+                cols = {c.strip().lower(): c for c in tmp.columns}
+                col_disc = cols.get("disciplina")
+                col_unid = cols.get("unidade")
+                col_aula = cols.get("aula")
+                col_prev = cols.get("entrega_prevista")
+                col_data = cols.get("data")
+                col_hora = cols.get("hora")
+
+                if not col_disc:
+                    inferida = infer_disciplina_from_filename(up.name)
+                    if inferida:
+                        tmp["disciplina"] = inferida
+                        col_disc = "disciplina"
+
+                faltando = [n for n, c in [("disciplina", col_disc), ("unidade", col_unid), ("aula", col_aula)] if not c]
+                if faltando:
+                    st.error(f"Arquivo sem colunas obrigatórias: {', '.join(faltando)}")
+                else:
+                    df_cg = pd.DataFrame(
+                        {
+                            "disciplina": tmp[col_disc].astype(str).str.strip(),
+                            "unidade": tmp[col_unid].apply(_norm_u),
+                            "aula": tmp[col_aula].apply(_norm_aula),
+                        }
+                    )
+                    if col_prev:
+                        dt = pd.to_datetime(tmp[col_prev], errors="coerce")
+                    else:
+                        if col_data and col_hora:
+                            dt = pd.to_datetime(
+                                tmp[col_data].astype(str).str.strip()
+                                + " "
+                                + tmp[col_hora].astype(str).str.strip(),
+                                errors="coerce",
+                                dayfirst=True,
+                            )
+                        elif col_data:
+                            dt = pd.to_datetime(tmp[col_data], errors="coerce", dayfirst=True)
+                        else:
+                            dt = pd.NaT
+                    df_cg["entrega_prevista_dt"] = dt
+
+                    antes = len(df_cg)
+                    df_cg = df_cg.dropna(subset=["disciplina", "unidade", "aula", "entrega_prevista_dt"])
+                    removidos = antes - len(df_cg)
+
+                    st.write("Pré-visualização normalizada:")
+                    prev = df_cg.copy()
+                    prev["entrega_prevista"] = prev["entrega_prevista_dt"].dt.strftime("%Y-%m-%d %H:%M")
+                    st.dataframe(prev.drop(columns=["entrega_prevista_dt"]), use_container_width=True, hide_index=True)
+                    st.caption(f"Linhas válidas: {len(df_cg)} | Descartadas: {removidos}")
+
+                    if st.button("🚀 Importar cronograma"):
+                        cur = conn.cursor()
+                        for _, r in df_cg.iterrows():
+                            cur.execute(
+                                """
+                                INSERT INTO cronograma (disciplina, unidade, aula, entrega_prevista)
+                                VALUES (?, ?, ?, ?)
+                                ON CONFLICT(disciplina, unidade, aula)
+                                DO UPDATE SET entrega_prevista=excluded.entrega_prevista
+                                """,
+                                (
+                                    r["disciplina"],
+                                    r["unidade"],
+                                    r["aula"],
+                                    r["entrega_prevista_dt"].strftime("%Y-%m-%d %H:%M"),
+                                ),
+                            )
+                        conn.commit()
+                        st.success(f"Cronograma importado/atualizado para {len(df_cg)} linhas.")
+
+    st.markdown("---")
+
+    # ===================== Status por arquivo =====================
+    work = filtrado.copy().assign(
+        _status=filtrado["entrega"].apply(lambda n: _infer_status(n)[0]),
+        _sort=filtrado["entrega"].apply(lambda n: _infer_status(n)[1]),
+    )
+
+    # proteger contra colunas duplicadas antes de montar a tabela de exibição
+    work = work.loc[:, ~work.columns.duplicated()]
+
+    # REMOVIDO data_entrega e status_file do quadro de status
+    show_cols = ["_id", "Novo", "disciplina", "unidade", "aula", "entrega", "data", "_status", "_sort", "prazo_entrega"]
+    show_cols = [c for c in show_cols if c in work.columns]
+    show = work[show_cols].rename(columns={"entrega": "Arquivo", "_status": "Status", "data": "Data (ord)"})
+
+    # ordem de colunas preferida para ordenar (aplicada apenas quando existirem)
+    preferred_sort = ["disciplina", "unidade", "aula", "_sort", "Data (ord)"]
+    available_sort = [c for c in preferred_sort if c in show.columns]
+    if available_sort:
+        # ascending: disciplina, unidade, aula ascending; _sort ascending; Data (ord) descending (we want newest first usually)
+        ascending = []
+        for c in available_sort:
+            if c == "Data (ord)":
+                ascending.append(False)
+            else:
+                ascending.append(True)
+        show = show.sort_values(by=available_sort, ascending=ascending, na_position='last')
+    # caso não haja colunas de ordenação, deixamos como está
+    show = show.reset_index(drop=True)
+    st.dataframe(show, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ---------- Expander: editar prazos por arquivo ----------
+    with st.expander("✏️ Editar prazos de entrega (por arquivo)"):
+        # build options from 'filtrado' to keep selection consistent with filters
+        options = []
+        id_map = {}
+        for _, row in filtrado.reset_index(drop=True).iterrows():
+            rid = int(row["_id"])
+            name = str(row["entrega"])
+            label = f"{rid} — {name}"
+            options.append(label)
+            id_map[label] = rid
+
+        if options:
+            sel_label = st.selectbox("Escolha o arquivo (rowid — nome)", options)
+            selected_id = id_map.get(sel_label)
+            current = filtrado.loc[filtrado["_id"] == selected_id]
+            if not current.empty and "prazo_entrega" in current.columns:
+                cur_prazo = pd.to_datetime(current.iloc[0]["prazo_entrega"], errors="coerce")
+            else:
+                cur_prazo = None
+
+            now_dt = datetime.now().replace(second=0, microsecond=0)
+            if pd.notna(cur_prazo):
+                default_date = cur_prazo.date()
+                default_time = cur_prazo.time()
+            else:
+                default_date = now_dt.date()
+                default_time = now_dt.time()
+
+            col_d, col_t, col_btn = st.columns([2, 1, 1])
+            with col_d:
+                d = st.date_input("Data limite (prazo)", value=default_date)
+            with col_t:
+                t = st.time_input("Hora (prazo)", value=default_time)
+            with col_btn:
+                if st.button("💾 Salvar prazo"):
+                    prazo_dt = datetime.combine(d, t)
+                    prazo_str = prazo_dt.strftime("%Y-%m-%d %H:%M")
+                    try:
+                        # inferir status do arquivo a partir do nome e salvar prazo + status
+                        cur = conn.cursor()
+                        # buscar nome do arquivo por rowid para inferir status
+                        cur.execute("SELECT entrega FROM entregas WHERE rowid = ?", (selected_id,))
+                        row = cur.fetchone()
+                        file_name = row[0] if row else ""
+                        status_inferido = _infer_status(file_name)[0]
+                        cur.execute("UPDATE entregas SET prazo_entrega = ?, status_file = ? WHERE rowid = ?", (prazo_str, status_inferido, selected_id))
+                        conn.commit()
+                        st.success(f"Prazo salvo: {prazo_str} (rowid={selected_id}) — status: {status_inferido}")
+                        # limpar cache e recarregar
+                        load_df.clear()
+                        df = load_df()
+                        filtrado = apply_filters(df)
+                        filtrado = tag_new_records(filtrado)
+                    except Exception as e:
+                        st.error(f"Falha ao salvar prazo: {e}")
+        else:
+            st.info("Não há registros visíveis para editar prazos.")
+
+    st.markdown("---")
+
+    # ===================== Semáforo (Entrega → REV1 → AJ1) =====================
+    st.subheader("🟢🟡🔴 Semáforo (Entrega → REV1 → AJ1)")
+    cg = pd.read_sql_query("SELECT disciplina, unidade, aula, entrega_prevista FROM cronograma", conn)
+    cg["unidade"] = cg["unidade"].apply(_norm_u)
+    cg["entrega_prevista_dt"] = pd.to_datetime(cg["entrega_prevista"], errors="coerce")
+
+    # nova stage_times que considera prazo_entrega preenchido pelo usuário
+    def stage_times(gr: pd.DataFrame) -> dict:
+        names = gr["entrega"].astype(str)
+        m_ent   = names.apply(lambda n: _rx_entrega.search(Path(n).stem) is not None)
+        m_rev1  = names.apply(lambda n: (m:=_rx_rev.search(Path(n).stem)) is not None and int((m.group(1) or m.group(2)))==1)
+        m_aj1   = names.apply(lambda n: (m:=_rx_aj.search(Path(n).stem))  is not None and int(m.group(1))==1)
+
+        # última data de RECEBIMENTO (data_entrega) para ENTREGA
+        t_ent = pick_latest(gr.loc[m_ent, "data_entrega"])
+        # último prazo_entrega (preenchido pelo usuário) entre arquivos tipo ENTREGA
+        prazo_ent = None
+        if "prazo_entrega" in gr.columns:
+            prazos = pd.to_datetime(gr.loc[m_ent, "prazo_entrega"], errors="coerce").dropna()
+            prazo_ent = prazos.max() if not prazos.empty else None
+
+        return {
+            "t_ent": t_ent,
+            "prazo_ent": prazo_ent,
+            "t_rev1": pick_latest(gr.loc[m_rev1, "data_entrega"]),
+            "t_aj": pick_latest(gr.loc[m_aj1,  "data_entrega"]),
+        }
+
+    base_groups = (
+        filtrado.groupby(["disciplina", "unidade", "aula"], dropna=False)
+        .apply(stage_times)
+        .apply(pd.Series)
+        .reset_index()
+    )
+
+    # normaliza chaves e evita conflito de tipos no merge
+    def _norm_keys(dfk: pd.DataFrame) -> pd.DataFrame:
+        out = dfk.copy()
+        out["disciplina"] = out["disciplina"].astype(str).str.strip().astype("string")
+        out["unidade"] = out["unidade"].apply(_norm_u).astype("string")
+        out["aula"] = out["aula"].apply(_norm_aula).astype("string")
+        return out
+
+    base_groups = _norm_keys(base_groups)
+    cg = _norm_keys(cg)
+
+    _SENT = "__NA__"
+    for d in (base_groups, cg):
+        d["unidade"] = d["unidade"].fillna(_SENT)
+        d["aula"] = d["aula"].fillna(_SENT)
+
+    merged = base_groups.merge(
+        cg.rename(columns={"entrega_prevista_dt": "due_entrega", "disciplina": "disciplina_cg"}),
+        left_on=["disciplina", "unidade", "aula"],
+        right_on=["disciplina_cg", "unidade", "aula"],
+        how="left",
+    ).drop(columns=["disciplina_cg"])
+
+    merged["unidade"] = merged["unidade"].replace(_SENT, pd.NA)
+    merged["aula"] = merged["aula"].replace(_SENT, pd.NA)
+
+    now = datetime.now()
+
+    # make_row atualizado: prioriza prazo_ent (usuario) para ENT due; REV1 = prazo_ent + 48h (se existente) ou fallback
+    def make_row(r):
+        due_from_cg = r.get("due_entrega", None)
+        prazo_ent = r.get("prazo_ent", None)  # do stage_times
+        # escolher due_ent: preferir prazo_ent (usuario) > due_from_cg (cronograma) > None
+        due_ent = pd.to_datetime(prazo_ent) if pd.notna(prazo_ent) else (pd.to_datetime(due_from_cg) if pd.notna(due_from_cg) else None)
+
+        t_ent = pd.to_datetime(r["t_ent"]) if pd.notna(r["t_ent"]) else None
+        t_rev = pd.to_datetime(r["t_rev1"]) if pd.notna(r["t_rev1"]) else None
+        t_aj  = pd.to_datetime(r["t_aj"]) if pd.notna(r["t_aj"]) else None
+
+        # RULES requested:
+        # - REV1: 48h after the prazo_ent (prefer) OR after due_from_cg OR fallback to t_ent+48h if nothing else
+        if pd.notna(prazo_ent):
+            due_rev = pd.to_datetime(prazo_ent) + timedelta(hours=48)
+        elif pd.notna(due_from_cg):
+            due_rev = pd.to_datetime(due_from_cg) + timedelta(hours=48)
+        elif t_ent is not None:
+            due_rev = t_ent + timedelta(hours=48)
+        else:
+            due_rev = None
+
+        # AJ1: 48h after the due_rev (if exist) else fallback to t_rev +48h
+        if due_rev is not None:
+            due_aj = due_rev + timedelta(hours=48)
+        elif t_rev is not None:
+            due_aj = t_rev + timedelta(hours=48)
+        else:
+            due_aj = None
+
+        # semáforo ENT usando due_ent (prefer user-supplied prazo)
+        ent_i, ent_m = ("•","sem prazo") if due_ent is None else semaforo(now, due_ent, t_ent)
+
+        if t_ent is None and due_ent is not None:
+            rev_i, rev_m = ("⏳", "aguardando ENTREGA")
+            aj_i, aj_m  = ("⏳", "aguardando REV1")
+        else:
+            rev_i, rev_m = (semaforo(now, due_rev, t_rev) if due_rev else ("⏳", "aguardando ENTREGA"))
+            aj_i, aj_m  = (semaforo(now, due_aj, t_aj) if due_aj else ("⏳", "aguardando REV1"))
+
+        # tempos restantes
+        rem_ent_s = (due_ent - now).total_seconds() if due_ent is not None else None
+        rem_rev_s = (due_rev - now).total_seconds() if due_rev is not None else None
+        rem_aj_s  = (due_aj - now).total_seconds() if due_aj is not None else None
+
+        def map_code(icon):
+            return {"🟢":0, "🟡":1, "🔴":2, "⏳":3, "•":4}.get(icon, 4)
+
+        return pd.Series(
+            {
+                "Prazo ENT": due_ent,
+                "Prazo REV1": due_rev,
+                "Prazo AJ1": due_aj,
+                "Recebido ENT": t_ent,
+                "Recebido REV1": t_rev,
+                "Recebido AJ1": t_aj,
+                "Semáforo ENT": f"{ent_i} {ent_m}",
+                "Semáforo REV1": f"{rev_i} {rev_m}",
+                "Semáforo AJ1": f"{aj_i} {aj_m}",
+                "Horas_restantes_ENT": _human_delta(rem_ent_s),
+                "Horas_restantes_REV1": _human_delta(rem_rev_s),
+                "Horas_restantes_AJ1": _human_delta(rem_aj_s),
+                "ENT_code": map_code(ent_i),
+                "REV1_code": map_code(rev_i),
+                "AJ1_code": map_code(aj_i),
+                "Prazo_ENT_origem": ("usuario" if pd.notna(prazo_ent) else ("cronograma" if pd.notna(due_from_cg) else "")),
+            }
+        )
+
+    quadro = merged.join(merged.apply(make_row, axis=1))
+
+    # evitar duplicatas de colunas caso ocorram
+    quadro = quadro.loc[:, ~quadro.columns.duplicated()]
+
+    def fmt(x):
+        return "" if (pd.isna(x) or x is None) else pd.to_datetime(x).strftime("%Y-%m-%d %H:%M")
+
+    view = quadro.copy()
+    for c in ["Prazo ENT", "Prazo REV1", "Prazo AJ1", "Recebido ENT", "Recebido REV1", "Recebido AJ1"]:
+        view[c] = view[c].apply(fmt)
+
+    # ordenar view somente se colunas existem
+    view_sort_pref = ["disciplina", "unidade", "aula"]
+    view_sort = [c for c in view_sort_pref if c in view.columns]
+    if view_sort:
+        view = view.sort_values(by=view_sort).reset_index(drop=True)
+
+    st.dataframe(
+        view[
+            [
+                col for col in [
+                    "disciplina",
+                    "unidade",
+                    "aula",
+                    "Prazo ENT",
+                    "Recebido ENT",
+                    "Semáforo ENT",
+                    "Horas_restantes_ENT",
+                    "Prazo REV1",
+                    "Recebido REV1",
+                    "Semáforo REV1",
+                    "Horas_restantes_REV1",
+                    "Prazo AJ1",
+                    "Recebido AJ1",
+                    "Semáforo AJ1",
+                    "Horas_restantes_AJ1",
+                ] if col in view.columns
+            ]
+        ]
+        .reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.caption(
+        "• Cadastre prazos de ENTREGA manualmente (no expander 'Editar prazos de entrega') ou por upload (XLSX/CSV). "
+        "• REV1 e AJ1 consideram janelas de 48h (REV1 = prazo_entrega + 48h; AJ1 = REV1 + 48h)."
+    )
