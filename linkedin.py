@@ -498,6 +498,7 @@ if not THORDATA_TOKEN:
     THORDATA_TOKEN = os.getenv("THORDATA_TOKEN", "").strip()
 
 # ---------------- UI ----------------
+st.title(" Cogna Talentos ")
 st.title("🔎   Pesquisa de Perfis - Linkedin ")
 st.caption(f"DB: {DB_PATH.resolve()}")
 st.markdown("Execute a busca; o resultado será automaticamente estruturado em tabela (nome, Link de perfil, Local e descrição).")
@@ -720,7 +721,8 @@ else:
     display_df["Local e descrição"] = display_df["Local e descrição"].astype(str).str.replace("\n", " ").str.slice(0, 500)
     st.dataframe(display_df, use_container_width=True)
 
-    export_col1, export_col2, export_col3 = st.columns([1,1,1])
+    # ajustado para 2 colunas (removido Exportar CSV (tabela exibida))
+    export_col1, export_col2 = st.columns([1,1])
 
     with export_col1:
         if st.button("⬇️ Exportar CSV (DB — todos perfis)", key="export_db_csv_btn"):
@@ -761,10 +763,6 @@ else:
             except Exception as e:
                 st.error(f"Falha ao exportar XLSX do DB: {e}\n(Verifique se openpyxl está instalado: pip install openpyxl)")
 
-    with export_col3:
-        csv_shown = display_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Exportar CSV (tabela exibida)", csv_shown, file_name="sourcing_perfis_displayed.csv", mime="text/csv", key="download_displayed_csv_btn")
-
     btn_col1, btn_col2 = st.columns([1,1])
     with btn_col1:
         if st.button("✅ Cadastrar (salvar no DB)", key="cadastrar_db_btn"):
@@ -774,10 +772,11 @@ else:
                 st.success(f"Registros salvos: {inserted}. Ignorados (duplicados): {ignored}.")
             except Exception as e:
                 st.error(f"Erro ao salvar no DB: {e}")
-    with btn_col2:
-        if st.button("🔁 Reset sessão (remove last_df)", key="reset_last_df_btn"):
-            st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
-            st.success("Sessão reiniciada (last_df limpo).")
+    # botão de reset de sessão removido conforme solicitado
+    # with btn_col2:
+    #     if st.button("🔁 Reset sessão (remove last_df)", key="reset_last_df_btn"):
+    #         st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
+    #         st.success("Sessão reiniciada (last_df limpo).")
 
 if count > 0:
     st.markdown("### Links (clique para abrir)")
@@ -809,10 +808,11 @@ with btns[0]:
 with btns[1]:
     if st.button("🔎 Consulta", key="open_consulta_btn"):
         st.session_state["consulta_open"] = True
-with btns[2]:
-    if st.button("🔁 Reset sessão (remove last_df)", key="reset_session_btn"):
-        st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
-        st.success("Sessão reiniciada (last_df limpo).")
+# removido o botão de reset da sessão neste painel conforme solicitado
+# with btns[2]:
+#     if st.button("🔁 Reset sessão (remove last_df)", key="reset_session_btn"):
+#         st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
+#         st.success("Sessão reiniciada (last_df limpo).")
 
 if st.session_state.get("consulta_open", False):
     st.markdown("---")
@@ -870,5 +870,3 @@ st.markdown("---")
 st.markdown(
     "**Aviso de Privacidade e Uso:** Mesmo sem busca por e-mails, trate nomes e links com responsabilidade (LGPD/GDPR)."
 )
-
-
