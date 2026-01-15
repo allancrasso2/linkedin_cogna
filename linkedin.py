@@ -19,7 +19,7 @@ import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Linkedin - Cogna", layout="wide")
+st.set_page_config(page_title="Cogna Talentos", layout="wide")
 
 # ---------------------------------------------------------------------
 # Toggle para mostrar/ocultar a seção "Cole / carregue JSON retornado"
@@ -870,3 +870,4 @@ st.markdown("---")
 st.markdown(
     "**Aviso de Privacidade e Uso:** Mesmo sem busca por e-mails, trate nomes e links com responsabilidade (LGPD/GDPR)."
 )
+
