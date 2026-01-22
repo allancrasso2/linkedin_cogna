@@ -2,8 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Pesquisa de Perfis - Linkedin · Thordata SERP — integrado (consulta -> tabela)
-Versão: oculta API key por padrão, valida entrada (location vs competence),
-filtro pós-processamento para garantir residência e presença da competência.
+Atualizado: adicionado gerenciamento de usuários (registro/login/logout),
+hashing de senhas (PBKDF2), e armazenamento de pesquisas salvas por usuário.
+Também: bloqueia acesso ao formulário/principal quando usuário não autenticado.
 """
 import os
 import time
@@ -18,13 +19,14 @@ from datetime import datetime
 import requests
 import pandas as pd
 import streamlit as st
+import hashlib
+import binascii
 
 st.set_page_config(page_title="Cogna Talentos", layout="wide")
 
 # ---------------------------------------------------------------------
 # Toggle para mostrar/ocultar a seção "Cole / carregue JSON retornado"
 # ---------------------------------------------------------------------
-# Por padrão ocultamos conforme solicitado. Mude para True para reativar.
 SHOW_JSON_SECTION = False
 # ---------------------------------------------------------------------
 
@@ -36,6 +38,11 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 # ---------------- Settings ----------------
 USER_AGENT = "Mozilla/5.0 (compatible; ThordataBot/1.0)"
 PER_REQUEST_DELAY = 0.5
+
+# ---------------- Simple auth parameters ----------------
+# PBKDF2 settings
+_PBKDF2_ITERATIONS = 100_000
+_SALT_BYTES = 16
 
 # ---------------- Residence extraction heuristics ----------------
 BRAZIL_STATE_NAMES = [
@@ -110,6 +117,7 @@ def extract_residence_from_description(text: Optional[str]) -> Optional[str]:
 def init_db():
     conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     cur = conn.cursor()
+    # profiles
     cur.execute("""
     CREATE TABLE IF NOT EXISTS sourcing_profiles (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,6 +129,30 @@ def init_db():
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_profile_link ON sourcing_profiles(profile_link);")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_local_desc ON sourcing_profiles(local_desc);")
+    # users (auth)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        salt TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        created_at TEXT
+    );
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);")
+    # saved searches per user
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS saved_searches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT,
+        params_json TEXT,
+        result_json TEXT,
+        created_at TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    """)
     conn.commit()
     return conn
 
@@ -173,6 +205,91 @@ def query_profiles(conn: sqlite3.Connection, location: str = "", competence: str
     cols = ["id", "nome", "Link de perfil", "Local e descrição", "created_at"]
     return pd.DataFrame(rows, columns=cols)
 
+# ---------------- Auth helpers ----------------
+def _derive_hash(password: str, salt: bytes) -> str:
+    """Returns hex digest of PBKDF2-HMAC-SHA256"""
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, _PBKDF2_ITERATIONS)
+    return binascii.hexlify(dk).decode("ascii")
+
+def create_user(username: str, password: str, role: str = "user") -> Tuple[bool, str]:
+    cur = _conn_for_app.cursor()
+    now = datetime.utcnow().isoformat()
+    try:
+        salt = os.urandom(_SALT_BYTES)
+        salt_hex = binascii.hexlify(salt).decode("ascii")
+        password_hash = _derive_hash(password, salt)
+        with _conn_for_app:
+            cur.execute("INSERT INTO users (username, password_hash, salt, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                        (username, password_hash, salt_hex, role, now))
+        return True, "Usuário criado com sucesso."
+    except sqlite3.IntegrityError:
+        return False, "Nome de usuário já existe."
+    except Exception as e:
+        return False, f"Erro ao criar usuário: {e}"
+
+def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
+    cur = _conn_for_app.cursor()
+    cur.execute("SELECT id, username, password_hash, salt, role, created_at FROM users WHERE username = ?", (username,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"id": r[0], "username": r[1], "password_hash": r[2], "salt": r[3], "role": r[4], "created_at": r[5]}
+
+def verify_user_credentials(username: str, password: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    u = get_user_by_username(username)
+    if not u:
+        return False, None
+    salt = binascii.unhexlify(u["salt"].encode("ascii"))
+    expected_hash = u["password_hash"]
+    given_hash = _derive_hash(password, salt)
+    if given_hash == expected_hash:
+        return True, u
+    return False, None
+
+def count_users() -> int:
+    cur = _conn_for_app.cursor()
+    cur.execute("SELECT COUNT(1) FROM users")
+    r = cur.fetchone()
+    return int(r[0]) if r else 0
+
+# ---------------- Saved searches helpers ----------------
+def save_search_for_user(user_id: int, title: str, params: Dict[str, Any], result_df: Optional[pd.DataFrame] = None) -> None:
+    cur = _conn_for_app.cursor()
+    now = datetime.utcnow().isoformat()
+    params_json = json.dumps(params, ensure_ascii=False)
+    result_json = ""
+    if result_df is not None:
+        try:
+            result_json = result_df.to_json(orient="records", force_ascii=False)
+        except Exception:
+            result_json = ""
+    with _conn_for_app:
+        cur.execute("INSERT INTO saved_searches (user_id, title, params_json, result_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, title[:200] if title else None, params_json, result_json, now))
+
+def get_saved_searches_for_user(user_id: int) -> List[Dict[str, Any]]:
+    cur = _conn_for_app.cursor()
+    cur.execute("SELECT id, title, params_json, created_at FROM saved_searches WHERE user_id = ? ORDER BY id DESC", (user_id,))
+    rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": r[0], "title": r[1], "params": json.loads(r[2]) if r[2] else {}, "created_at": r[3]})
+    return out
+
+def get_saved_search_by_id(search_id: int) -> Optional[Dict[str, Any]]:
+    cur = _conn_for_app.cursor()
+    cur.execute("SELECT id, user_id, title, params_json, result_json, created_at FROM saved_searches WHERE id = ?", (search_id,))
+    r = cur.fetchone()
+    if not r:
+        return None
+    return {"id": r[0], "user_id": r[1], "title": r[2], "params": json.loads(r[3]) if r[3] else {}, "result_json": r[4], "created_at": r[5]}
+
+def delete_saved_search(search_id: int, user_id: int) -> bool:
+    cur = _conn_for_app.cursor()
+    with _conn_for_app:
+        cur.execute("DELETE FROM saved_searches WHERE id = ? AND user_id = ?", (search_id, user_id))
+        return cur.rowcount > 0
+
 # ---------------- Utils / Heurísticas de validação ----------------
 COMMON_SKILLS = {
     "python","java","javascript","typescript","go","golang","c#","c++","c","sql","aws","azure","gcp",
@@ -197,7 +314,6 @@ def is_probable_competence(text: str) -> bool:
     for tok in toks:
         if tok in COMMON_SKILLS:
             return True
-        # generic pattern for short tokens like "python", "aws"
         if re.fullmatch(r"[a-z0-9\+\-\#\. ]{1,30}", tok):
             if tok.upper() not in BRAZIL_STATE_ABBR and len(tok) > 1:
                 return True
@@ -208,29 +324,19 @@ def is_probable_location(text: str) -> bool:
         return False
     t = text.strip()
     low = t.lower()
-    # contains state full name or abbreviation
     for s in BRAZIL_STATE_NAMES + [s.lower() for s in BRAZIL_STATE_ABBR]:
         if s in low:
             return True
-    # patterns like "City, ST" or "City/ST"
     if re.search(r",\s*[A-Za-z]{1,4}$", t) or re.search(r"/\s*[A-Za-z]{1,4}$", t):
         return True
-    # single capitalized word (City) with length > 3
     if re.fullmatch(r"[A-ZÀ-Ý][a-zà-ÿ]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ]+){0,2}", t):
         if len(t) > 3:
             return True
-    # patterns like "City - State" or "City | State"
     if re.search(r"[A-Za-zÀ-ÿ]+(?:\s+[A-Za-zÀ-ÿ]+)*\s*[-|]\s*[A-Za-zÀ-ÿ]{1,20}", t):
         return True
     return False
 
 def is_strict_location_ok(text: str) -> bool:
-    """
-    Requisito mais rígido para permitir uma busca:
-      - deve conter vírgula ou barra com UF (ex.: 'Campinas, SP' ou 'Campinas/SP')
-      - ou conter nome completo de estado (ex.: 'São Paulo')
-      - ou ser 'Cidade - Estado' / 'Cidade | Estado'
-    """
     if not text or not isinstance(text, str):
         return False
     t = text.strip()
@@ -497,374 +603,565 @@ if not THORDATA_TOKEN:
 if not THORDATA_TOKEN:
     THORDATA_TOKEN = os.getenv("THORDATA_TOKEN", "").strip()
 
-# ---------------- UI ----------------
+# ---------------- UI / Auth UI ----------------
+if "user_logged_in" not in st.session_state:
+    st.session_state["user_logged_in"] = False
+if "user_info" not in st.session_state:
+    st.session_state["user_info"] = None
+
+# ---------------------------
+# REPLACED login_ui(): show "Registrar" only when:
+#  - no users exist (bootstrap) OR
+#  - an admin is currently logged in
+# ---------------------------
+def login_ui():
+    st.sidebar.subheader("🔐 Conta")
+
+    users_count = count_users()
+    logged = st.session_state.get("user_logged_in", False)
+    current_user = st.session_state.get("user_info")
+
+    # Determine available actions
+    if users_count == 0:
+        actions = ["Entrar", "Registrar", "Perfil"]
+    else:
+        if logged and current_user and current_user.get("role") == "admin":
+            actions = ["Entrar", "Registrar", "Perfil"]
+        else:
+            actions = ["Entrar", "Perfil"]
+
+    tab = st.sidebar.radio("Ação", actions, index=0)
+
+    if tab == "Entrar":
+        username = st.sidebar.text_input("Usuário", key="login_user")
+        password = st.sidebar.text_input("Senha", type="password", key="login_pwd")
+        if st.sidebar.button("Entrar", key="login_btn"):
+            ok, user = verify_user_credentials((username or "").strip(), password or "")
+            if ok and user:
+                st.session_state["user_logged_in"] = True
+                st.session_state["user_info"] = user
+                st.success(f"Bem-vindo, {user['username']} ({user['role']})")
+            else:
+                st.error("Usuário ou senha inválidos.")
+
+    elif tab == "Registrar":
+        # If there are users and current user isn't admin, block registration
+        if users_count > 0 and not (logged and current_user and current_user.get("role") == "admin"):
+            st.sidebar.error("Apenas usuários com perfil 'admin' podem criar novas contas.")
+            st.sidebar.caption("Peça a um admin para criar sua conta ou contate o responsável pelo sistema.")
+        else:
+            st.sidebar.markdown("**Criar nova conta**")
+            new_user = st.sidebar.text_input("Nome de usuário", key="reg_user")
+            new_pwd = st.sidebar.text_input("Senha", type="password", key="reg_pwd")
+            confirm = st.sidebar.text_input("Confirme a senha", type="password", key="reg_pwd2")
+
+            first_user_is_admin = users_count == 0
+            if first_user_is_admin:
+                st.sidebar.info("Primeira conta criada será atribuída como admin.")
+            if st.sidebar.button("Registrar", key="reg_btn"):
+                if not new_user or not new_pwd:
+                    st.sidebar.error("Informe usuário e senha.")
+                elif new_pwd != confirm:
+                    st.sidebar.error("Senhas não conferem.")
+                else:
+                    role = "admin" if first_user_is_admin else "user"
+                    ok, msg = create_user(new_user.strip(), new_pwd, role=role)
+                    if ok:
+                        st.sidebar.success(msg + f" (role: {role})")
+                    else:
+                        st.sidebar.error(msg)
+
+    else:  # Perfil
+        if not st.session_state.get("user_logged_in"):
+            st.sidebar.info("Nenhum usuário autenticado.")
+        else:
+            user = st.session_state.get("user_info")
+            st.sidebar.markdown(f"**Usuário:** {user['username']}  \n**Role:** {user['role']}")
+            if st.sidebar.button("Sair", key="logout_btn"):
+                st.session_state["user_logged_in"] = False
+                st.session_state["user_info"] = None
+                st.sidebar.success("Você saiu da sessão.")
+
+login_ui()
+
+# ---------------- main UI ----------------
 st.title(" Cogna Talentos ")
 st.title("🔎   Pesquisa de Perfis - Linkedin ")
 st.caption(f"DB: {DB_PATH.resolve()}")
 st.markdown("Execute a busca; o resultado será automaticamente estruturado em tabela (nome, Link de perfil, Local e descrição).")
 
-with st.sidebar:
-    st.header("Configurações API / Query")
-    if THORDATA_TOKEN:
-        st.markdown("**API Key:** carregada a partir de arquivo local (oculta).")
-    else:
-        st.warning("Nenhuma API Key local encontrada. Defina `thordata_token.txt`, `secrets.py`, ou variável de ambiente `THORDATA_TOKEN`.")
-    st.markdown("---")
-    st.caption("Desbloqueie a edição da API Key com senha (apenas admin).")
-    passwd = st.text_input("Senha para desbloquear (admin)", type="password", key="unlock_pwd")
-    if st.button("Desbloquear", key="unlock_btn"):
-        if passwd == "Cogna26":
-            st.session_state["api_unlocked"] = True
-            st.success("Sidebar desbloqueada. Campo da API agora visível (oculto por padrão).")
-        else:
-            st.session_state["api_unlocked"] = False
-            st.error("Senha incorreta.")
-    api_token_field_value = THORDATA_TOKEN or ""
-    if st.session_state.get("api_unlocked", False):
-        api_token = st.text_input("TheirData API Key (Bearer)", value=api_token_field_value, type="password", key="api_token_input")
-        if api_token and api_token != THORDATA_TOKEN:
-            THORDATA_TOKEN = api_token.strip()
-    st.markdown("---")
-    st.header("Parâmetros padrão")
-    engine = st.selectbox("Mecanismo", options=["google", "bing"], index=0, key="mecanismo")
-    domain = st.selectbox("Domínio Google", options=["google.com", "google.com.br", "google.co.uk"], index=0, key="domain_select")
-    gl = st.selectbox("País (gl)", options=["BR", "US", "CA", "UK", ""], index=0, key="gl_select")
-    hl = st.selectbox("Idioma (hl)", options=["pt-BR", "en", "pt", ""], index=0, key="hl_select")
-    render_js = st.checkbox("Renderizar JS (mais lento/custoso)", value=False, key="render_js_sidebar")
+# --------------------------
+# Defaults for variables used later (to avoid NameError when form hidden)
+# --------------------------
+area = st.session_state.get('area_sel', "Outro")
+competence = st.session_state.get('competence_input', "")
+location = st.session_state.get('location_input', "")
+free_text = st.session_state.get('free_text_input', "")
+linkedin_only = st.session_state.get('linkedin_only_cb', False)
+per_page = st.session_state.get('per_page_slider', 10)
+page_idx = st.session_state.get('page_idx_num', 0)
+show_raw = st.session_state.get('show_raw_cb', False)
+submitted = False
 
-with st.form("search_form"):
-    st.subheader("Filtros de busca")
-    area = st.selectbox("Área (ex.:)", ["Administração", "Contabilidade", "Direito", "Economia", "Engenharia", "Estética", "Humanas", "Licenciatura","Saúde","Tecnologia","Outro"], index=0, key="area_sel")
-    competence = st.text_input("Competência / skill (ex.: Python, AWS, Spark)", placeholder="python, aws, spark", key="competence_input")
-    location = st.text_input("Localidade (cidade / estado / país)", placeholder="São Paulo, Brazil", key="location_input")
-    free_text = st.text_input("Termos adicionais (ex.: 'Bacharel', 'Mestrado', 'Sênior')", placeholder="", key="free_text_input")
-    linkedin_only = st.checkbox("Somente LinkedIn (perfils) — site:linkedin.com/in", value=False,
-                                help="Se marcado, a query será prefixada com site:linkedin.com/in OR site:linkedin.com/pub",
-                                key="linkedin_only_cb")
-    per_page = st.slider("Resultados por página (limite para tabela)", min_value=5, max_value=50, value=10, step=5, key="per_page_slider")
-    page_idx = st.number_input("Página (0 = primeira)", min_value=0, value=0, step=1, key="page_idx_num")
-    show_raw = st.checkbox("Mostrar JSON cru (após consulta)", value=False, key="show_raw_cb")
-    submitted = st.form_submit_button("🔎 Pesquisar", key="form_submit_btn")
-
-if "last_resp" not in st.session_state:
-    st.session_state["last_resp"] = None
-if "last_df" not in st.session_state:
-    st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
-if "consulta_open" not in st.session_state:
-    st.session_state["consulta_open"] = False
-
-def build_query(area: str, competence: str, location: str, free_text: str, linkedin_only: bool) -> str:
-    parts = []
-    if area and area != "Outro":
-        parts.append(area)
-    if competence:
-        parts.append(competence)
-    if location:
-        parts.append(location)
-    if free_text:
-        parts.append(free_text)
-    q = " ".join(parts).strip()
-    if linkedin_only:
-        if q:
-            q = f"(site:linkedin.com/in OR site:linkedin.com/pub) {q}"
-        else:
-            q = "(site:linkedin.com/in OR site:linkedin.com/pub)"
-    return q
-
-# Validation: require both fields and ensure not swapped
-def validate_field_positions(location_input: str, competence_input: str) -> Tuple[bool, Optional[str]]:
-    loc = (location_input or "").strip()
-    comp = (competence_input or "").strip()
-    # require location and competence present
-    if not comp:
-        return False, "Campo 'Competência' obrigatório — informe a(s) skill(s) (ex.: Python)."
-    if not loc:
-        return False, "Campo 'Localidade' obrigatório — informe cidade/estado/país (ex.: Campinas/SP)."
-    # if location looks like competence -> reject
-    if is_probable_competence(loc) and not is_probable_location(loc):
-        return False, "Localidade parece conter competências (ex.: 'Python'). Corrija os campos."
-    # if competence looks like location -> reject
-    if is_probable_location(comp) and not is_probable_competence(comp):
-        return False, "Competência parece conter localização (ex.: 'Campinas/SP'). Corrija os campos."
-    # Additional sanity: ensure location is probable location
-    if not is_probable_location(loc):
-        # allow some flexibility: if user writes long textual location, still accept; otherwise warn
-        if len(loc) < 4 or not re.search(r"[A-Za-zÀ-ÿ]", loc):
-            return False, "Localidade inserida não parece válida. Use formato 'Cidade, Estado' ou 'Cidade/UF' (ex.: Campinas/SP)."
-    return True, None
-
-# When the user submits:
-if submitted:
-    token_to_use = ""
-    if st.session_state.get("api_unlocked", False) and "api_token_input" in st.session_state:
-        token_to_use = (st.session_state.get("api_token_input") or "").strip()
-    if not token_to_use:
-        token_to_use = THORDATA_TOKEN.strip()
-    if not token_to_use:
-        st.error("Token não fornecido. Defina thordata_token.txt ou THORDATA_TOKEN no ambiente, ou desbloqueie e cole a chave.")
-    else:
-        # primeira validação (mais amigável)
-        ok, reason = validate_field_positions(location, competence)
-        if not ok:
-            st.error(reason)
-        else:
-            # --- NOVA guarda if/else rigorosa ---
-            # tokens
-            loc_tokens = tokenize_input(location)
-            comp_tokens = tokenize_input(competence)
-
-            # 1) bloqueia se qualquer token de localidade é claramente uma skill
-            loc_has_skill_token = any(tok in COMMON_SKILLS for tok in loc_tokens)
-
-            # 2) bloqueia se localidade não satisfaz critério "estrito" (ex.: sem UF/estado)
-            loc_not_strict = not is_strict_location_ok(location)
-
-            # 3) bloqueia se competence parecer uma localidade (ex.: 'Campinas/SP' no campo competence)
-            comp_looks_like_loc = is_probable_location(competence) and not is_probable_competence(competence)
-
-            # 4) bloqueia se os dois campos forem identicos (provável erro)
-            fields_identical = location.strip().lower() == competence.strip().lower() and bool(location.strip())
-
-            # If/else: decidir se seguimos com a consulta
-            if loc_has_skill_token:
-                st.error("Bloqueado: o campo 'Localidade' contém tokens que parecem competências (ex.: 'Python', 'Java'). Corrija o campo Localidade.")
-                st.info("Dica: escreva 'Campinas, SP' ou 'Campinas/SP' no campo Localidade.")
-                # interrompe aqui
-                st.stop()
-            if comp_looks_like_loc:
-                st.error("Bloqueado: o campo 'Competência' parece conter uma localidade (ex.: 'Campinas/SP'). Corrija o campo Competência.")
-                st.stop()
-            if fields_identical:
-                st.error("Bloqueado: os campos 'Localidade' e 'Competência' não podem ser iguais.")
-                st.stop()
-            # Se a localidade não estiver em formato estrito, bloqueia (para evitar buscas por skills no campo Local)
-            if loc_not_strict:
-                # mas dê uma mensagem clara e orientações
-                st.error("Bloqueado: o campo 'Localidade' não está em formato esperado (ex.: 'Cidade, UF' ou 'Cidade/UF').")
-                st.info("Formate a localidade como 'Campinas, SP' ou 'Campinas/SP' para prosseguir.")
-                st.stop()
-            # --- fim da guarda if/else ---
-
-            # se chegamos aqui, os campos parecem consistentes — monta query e faz a chamada
-            q = build_query(area, competence, location, free_text, linkedin_only)
-            if not q:
-                st.warning("Query vazia — informe ao menos uma competência, área ou localidade.")
-            else:
-                start = page_idx * per_page
-                with st.spinner("Consultando Thordata (SERP)..."):
-                    try:
-                        resp_obj = thordata_search(token=token_to_use, q=q, engine=engine,
-                                                   domain=domain, gl=(gl or None), hl=(hl or None),
-                                                   start=start, num=per_page, render_js=render_js)
-                    except Exception as e:
-                        st.error(f"Erro na busca: {e}")
-                        resp_obj = None
-
-                st.session_state["last_resp"] = resp_obj
-                if resp_obj is not None:
-                    df_table, err = resp_to_table(resp_obj, max_rows=per_page)
-                    if err:
-                        st.warning(err)
-                    filtered_df = filter_api_results(resp_obj, df_table, competence or "", location or "")
-                    if filtered_df.empty and (competence or location):
-                        st.warning("Nenhum resultado após aplicar validações de Localidade/Competência. Tente relaxar os filtros ou revisar os campos.")
-                        # keep original df_table for inspection (but still warn)
-                        st.session_state["last_df"] = df_table
-                    else:
-                        st.session_state["last_df"] = filtered_df if not filtered_df.empty else df_table
-                else:
-                    st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
-
-# --- Seção de COLAR/FAZER UPLOAD JSON (opcional) ---
-# Abaixo o bloco fica oculto por padrão (SHOW_JSON_SECTION=False).
-if SHOW_JSON_SECTION:
-    st.markdown("---")
-    st.subheader("Ou: cole / carregue um JSON retornado pela API (opcional)")
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        pasted = st.text_area("Cole o JSON aqui (opcional)", height=140, placeholder='Cole aqui o JSON retornado pela API...', key="pasted_json")
-    with col2:
-        upload = st.file_uploader("Ou faça upload do arquivo JSON", type=["json"], key="upload_json")
-
-    if st.button("🔧 Montar tabela a partir do JSON colado/subido", key="montar_json_btn"):
-        content = None
-        if upload is not None:
-            try:
-                raw = upload.read()
-                content = raw.decode("utf-8")
-            except Exception as e:
-                st.error(f"Erro lendo arquivo: {e}")
-        elif pasted and pasted.strip():
-            content = pasted.strip()
-        if content:
-            df_table, err = resp_to_table(content, max_rows=per_page)
-            if err:
-                st.warning(err)
-            st.session_state["last_df"] = df_table
-            parsed, jerr = safe_json_load(content)
-            if parsed:
-                st.session_state["last_resp"] = parsed
-        else:
-            st.info("Nenhum JSON fornecido para montar a tabela.")
-# ---------------------------------------------------------------------
-
-# ----- Mostrar resultados estruturados (da última resposta / upload) -----
-st.markdown("---")
-df_table = st.session_state.get("last_df", pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"]))
-count = int(df_table.shape[0]) if hasattr(df_table, "shape") else 0
-st.markdown(f"### Resultados estruturados — {count} registros (mostrando até {per_page})")
-
-if count == 0:
-    st.info("Nenhum registro extraído para a tabela após limpeza heurística.")
+# If user is not logged in, hide the main search form and results
+if not st.session_state.get("user_logged_in"):
+    st.warning("Atenção — faça login para acessar os filtros de busca e os resultados.")
+    st.info("Use o painel 'Conta' na barra lateral para Entrar ou Registrar. As configurações da API permanecem disponíveis na lateral.")
 else:
-    display_df = df_table[["nome", "Link de perfil", "Local e descrição"]].copy()
-    display_df["Local e descrição"] = display_df["Local e descrição"].astype(str).str.replace("\n", " ").str.slice(0, 500)
-    st.dataframe(display_df, use_container_width=True)
-
-    # ajustado para 2 colunas (removido Exportar CSV (tabela exibida))
-    export_col1, export_col2 = st.columns([1,1])
-
-    with export_col1:
-        if st.button("⬇️ Exportar CSV (DB — todos perfis)", key="export_db_csv_btn"):
-            try:
-                df_db = fetch_all_profiles(_conn_for_app)
-                if df_db.empty:
-                    st.info("Banco vazio — nada para exportar.")
-                else:
-                    csv_bytes = df_db.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Clique para baixar CSV (DB)",
-                        data=csv_bytes,
-                        file_name="sourcing_profiles_db.csv",
-                        mime="text/csv",
-                        key="download_db_csv_btn"
-                    )
-            except Exception as e:
-                st.error(f"Falha ao exportar CSV do DB: {e}")
-
-    with export_col2:
-        if st.button("⬇️ Exportar XLSX (DB — todos perfis)", key="export_db_xlsx_btn"):
-            try:
-                df_db = fetch_all_profiles(_conn_for_app)
-                if df_db.empty:
-                    st.info("Banco vazio — nada para exportar.")
-                else:
-                    out = io.BytesIO()
-                    with pd.ExcelWriter(out, engine="openpyxl") as xw:
-                        df_db.to_excel(xw, sheet_name="Perfis", index=False)
-                    out.seek(0)
-                    st.download_button(
-                        "Clique para baixar XLSX (DB)",
-                        data=out.getvalue(),
-                        file_name="sourcing_profiles_db.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="download_db_xlsx_btn"
-                    )
-            except Exception as e:
-                st.error(f"Falha ao exportar XLSX do DB: {e}\n(Verifique se openpyxl está instalado: pip install openpyxl)")
-
-    btn_col1, btn_col2 = st.columns([1,1])
-    with btn_col1:
-        if st.button("✅ Cadastrar (salvar no DB)", key="cadastrar_db_btn"):
-            try:
-                conn = _conn_for_app
-                inserted, ignored = save_profiles_to_db(df_table, conn)
-                st.success(f"Registros salvos: {inserted}. Ignorados (duplicados): {ignored}.")
-            except Exception as e:
-                st.error(f"Erro ao salvar no DB: {e}")
-    # botão de reset de sessão removido conforme solicitado
-    # with btn_col2:
-    #     if st.button("🔁 Reset sessão (remove last_df)", key="reset_last_df_btn"):
-    #         st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
-    #         st.success("Sessão reiniciada (last_df limpo).")
-
-if count > 0:
-    st.markdown("### Links (clique para abrir)")
-    for _, r in df_table.head(per_page).iterrows():
-        nome = r.get("nome") or "(sem nome)"
-        link = r.get("Link de perfil") or ""
-        local_desc = (r.get("Local e descrição") or "")[:200]
-        if link:
-            st.write(f"- [{nome}]({link}) — {local_desc}")
+    # ---------------- UI Sidebar (API controls) - remains visible but can be adjusted by admin (unchanged) ----------------
+    # Note: part of the sidebar was already rendered by login_ui(); here we show API config and params in main sidebar area.
+    with st.sidebar:
+        st.header("Configurações API / Query")
+        if THORDATA_TOKEN:
+            st.markdown("**API Key:** carregada a partir de arquivo local (oculta).")
         else:
-            st.write(f"- {nome} — {local_desc}")
-
-# painel: visualizar registros já cadastrados no banco (com botão Consulta)
-st.markdown("---")
-st.subheader("📚 Registros cadastrados no banco")
-btns = st.columns([1,1,1])
-with btns[0]:
-    if st.button("Carregar registros do DB", key="carregar_db_btn"):
-        try:
-            df_db = fetch_all_profiles(_conn_for_app)
-            if df_db.empty:
-                st.info("Nenhum registro cadastrado ainda.")
+            st.warning("Nenhuma API Key local encontrada. Defina `thordata_token.txt`, `secrets.py`, ou variável de ambiente `THORDATA_TOKEN`.")
+        st.markdown("---")
+        st.caption("Desbloqueie a edição da API Key com senha (apenas admin).")
+        passwd = st.text_input("Senha para desbloquear (admin)", type="password", key="unlock_pwd")
+        if st.button("Desbloquear", key="unlock_btn"):
+            if passwd == "Cogna26":
+                st.session_state["api_unlocked"] = True
+                st.success("Sidebar desbloqueada. Campo da API agora visível (oculto por padrão).")
             else:
-                st.dataframe(df_db, use_container_width=True)
-                csv_db = df_db.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Exportar CSV (DB)", csv_db, file_name="sourcing_profiles_db.csv", mime="text/csv", key="download_db_btn_panel")
-        except Exception as e:
-            st.error(f"Erro ao ler DB: {e}")
-with btns[1]:
-    if st.button("🔎 Consulta", key="open_consulta_btn"):
-        st.session_state["consulta_open"] = True
-# removido o botão de reset da sessão neste painel conforme solicitado
-# with btns[2]:
-#     if st.button("🔁 Reset sessão (remove last_df)", key="reset_session_btn"):
-#         st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
-#         st.success("Sessão reiniciada (last_df limpo).")
+                st.session_state["api_unlocked"] = False
+                st.error("Senha incorreta.")
+        api_token_field_value = THORDATA_TOKEN or ""
+        if st.session_state.get("api_unlocked", False):
+            api_token = st.text_input("TheirData API Key (Bearer)", value=api_token_field_value, type="password", key="api_token_input")
+            if api_token and api_token != THORDATA_TOKEN:
+                THORDATA_TOKEN = api_token.strip()
+        st.markdown("---")
+        st.header("Parâmetros padrão")
+        engine = st.selectbox("Mecanismo", options=["google", "bing"], index=0, key="mecanismo")
+        domain = st.selectbox("Domínio Google", options=["google.com", "google.com.br", "google.co.uk"], index=0, key="domain_select")
+        gl = st.selectbox("País (gl)", options=["BR", "US", "CA", "UK", ""], index=0, key="gl_select")
+        hl = st.selectbox("Idioma (hl)", options=["pt-BR", "en", "pt", ""], index=0, key="hl_select")
+        render_js = st.checkbox("Renderizar JS (mais lento/custoso)", value=False, key="render_js_sidebar")
 
-if st.session_state.get("consulta_open", False):
+    # ---------------- Search form (only visible to logged users) ----------------
+    with st.form("search_form"):
+        st.subheader("Filtros de busca")
+        area = st.selectbox("Área (ex.:)", ["Administração", "Contabilidade", "Direito", "Economia", "Engenharia", "Estética", "Humanas", "Licenciatura","Saúde","Tecnologia","Outro"], index=0, key="area_sel")
+        competence = st.text_input("Competência / skill (ex.: Python, AWS, Spark)", placeholder="python, aws, spark", key="competence_input")
+        location = st.text_input("Localidade (cidade / estado / país)", placeholder="São Paulo, Brazil", key="location_input")
+        free_text = st.text_input("Termos adicionais (ex.: 'Bacharel', 'Mestrado', 'Sênior')", placeholder="", key="free_text_input")
+        linkedin_only = st.checkbox("Somente LinkedIn (perfils) — site:linkedin.com/in", value=False,
+                                    help="Se marcado, a query será prefixada com site:linkedin.com/in OR site:linkedin.com/pub",
+                                    key="linkedin_only_cb")
+        per_page = st.slider("Resultados por página (limite para tabela)", min_value=5, max_value=50, value=10, step=5, key="per_page_slider")
+        page_idx = st.number_input("Página (0 = primeira)", min_value=0, value=0, step=1, key="page_idx_num")
+        show_raw = st.checkbox("Mostrar JSON cru (após consulta)", value=False, key="show_raw_cb")
+        submitted = st.form_submit_button("🔎 Pesquisar", key="form_submit_btn")
+
+    if "last_resp" not in st.session_state:
+        st.session_state["last_resp"] = None
+    if "last_df" not in st.session_state:
+        st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
+    if "consulta_open" not in st.session_state:
+        st.session_state["consulta_open"] = False
+
+    def build_query(area: str, competence: str, location: str, free_text: str, linkedin_only: bool) -> str:
+        parts = []
+        if area and area != "Outro":
+            parts.append(area)
+        if competence:
+            parts.append(competence)
+        if location:
+            parts.append(location)
+        if free_text:
+            parts.append(free_text)
+        q = " ".join(parts).strip()
+        if linkedin_only:
+            if q:
+                q = f"(site:linkedin.com/in OR site:linkedin.com/pub) {q}"
+            else:
+                q = "(site:linkedin.com/in OR site:linkedin.com/pub)"
+        return q
+
+    # Validation: require both fields and ensure not swapped
+    def validate_field_positions(location_input: str, competence_input: str) -> Tuple[bool, Optional[str]]:
+        loc = (location_input or "").strip()
+        comp = (competence_input or "").strip()
+        # require location and competence present
+        if not comp:
+            return False, "Campo 'Competência' obrigatório — informe a(s) skill(s) (ex.: Python)."
+        if not loc:
+            return False, "Campo 'Localidade' obrigatório — informe cidade/estado/país (ex.: Campinas/SP)."
+        # if location looks like competence -> reject
+        if is_probable_competence(loc) and not is_probable_location(loc):
+            return False, "Localidade parece conter competências (ex.: 'Python'). Corrija os campos."
+        # if competence looks like location -> reject
+        if is_probable_location(comp) and not is_probable_competence(comp):
+            return False, "Competência parece conter localização (ex.: 'Campinas/SP'). Corrija os campos."
+        # Additional sanity: ensure location is probable location
+        if not is_probable_location(loc):
+            # allow some flexibility: if user writes long textual location, still accept; otherwise warn
+            if len(loc) < 4 or not re.search(r"[A-Za-zÀ-ÿ]", loc):
+                return False, "Localidade inserida não parece válida. Use formato 'Cidade, Estado' ou 'Cidade/UF' (ex.: Campinas/SP)."
+        return True, None
+
+    # When the user submits:
+    if submitted:
+        token_to_use = ""
+        if st.session_state.get("api_unlocked", False) and "api_token_input" in st.session_state:
+            token_to_use = (st.session_state.get("api_token_input") or "").strip()
+        if not token_to_use:
+            token_to_use = THORDATA_TOKEN.strip()
+        if not token_to_use:
+            st.error("Token não fornecido. Defina thordata_token.txt ou THORDATA_TOKEN no ambiente, ou desbloqueie e cole a chave.")
+        else:
+            ok, reason = validate_field_positions(location, competence)
+            if not ok:
+                st.error(reason)
+            else:
+                # --- NOVA guarda if/else rigorosa ---
+                loc_tokens = tokenize_input(location)
+                comp_tokens = tokenize_input(competence)
+
+                # 1) bloqueia se qualquer token de localidade é claramente uma skill
+                loc_has_skill_token = any(tok in COMMON_SKILLS for tok in loc_tokens)
+
+                # 2) bloqueia se localidade não satisfaz critério "estrito" (ex.: sem UF/estado)
+                loc_not_strict = not is_strict_location_ok(location)
+
+                # 3) bloqueia se competence parecer uma localidade (ex.: 'Campinas/SP' no campo competence)
+                comp_looks_like_loc = is_probable_location(competence) and not is_probable_competence(competence)
+
+                # 4) bloqueia se os dois campos forem identicos (provável erro)
+                fields_identical = location.strip().lower() == competence.strip().lower() and bool(location.strip())
+
+                # If/else: decidir se seguimos com a consulta
+                if loc_has_skill_token:
+                    st.error("Bloqueado: o campo 'Localidade' contém tokens que parecem competências (ex.: 'Python', 'Java'). Corrija o campo Localidade.")
+                    st.info("Dica: escreva 'Campinas, SP' ou 'Campinas/SP' no campo Localidade.")
+                    # interrompe aqui
+                    st.stop()
+                if comp_looks_like_loc:
+                    st.error("Bloqueado: o campo 'Competência' parece conter uma localidade (ex.: 'Campinas/SP'). Corrija o campo Competência.")
+                    st.stop()
+                if fields_identical:
+                    st.error("Bloqueado: os campos 'Localidade' e 'Competência' não podem ser iguais.")
+                    st.stop()
+                # Se a localidade não estiver em formato estrito, bloqueia (para evitar buscas por skills no campo Local)
+                if loc_not_strict:
+                    # mas dê uma mensagem clara e orientações
+                    st.error("Bloqueado: o campo 'Localidade' não está em formato esperado (ex.: 'Cidade, UF' ou 'Cidade/UF').")
+                    st.info("Formate a localidade como 'Campinas, SP' ou 'Campinas/SP' para prosseguir.")
+                    st.stop()
+                # --- fim da guarda if/else ---
+
+                # se chegamos aqui, os campos parecem consistentes — monta query e faz a chamada
+                q = build_query(area, competence, location, free_text, linkedin_only)
+                if not q:
+                    st.warning("Query vazia — informe ao menos uma competência, área ou localidade.")
+                else:
+                    start = page_idx * per_page
+                    with st.spinner("Consultando Thordata (SERP)..."):
+                        try:
+                            resp_obj = thordata_search(token=token_to_use, q=q, engine=engine,
+                                                       domain=domain, gl=(gl or None), hl=(hl or None),
+                                                       start=start, num=per_page, render_js=render_js)
+                        except Exception as e:
+                            st.error(f"Erro na busca: {e}")
+                            resp_obj = None
+
+                    st.session_state["last_resp"] = resp_obj
+                    if resp_obj is not None:
+                        df_table, err = resp_to_table(resp_obj, max_rows=per_page)
+                        if err:
+                            st.warning(err)
+                        filtered_df = filter_api_results(resp_obj, df_table, competence or "", location or "")
+                        if filtered_df.empty and (competence or location):
+                            st.warning("Nenhum resultado após aplicar validações de Localidade/Competência. Tente relaxar os filtros ou revisar os campos.")
+                            # keep original df_table for inspection (but still warn)
+                            st.session_state["last_df"] = df_table
+                        else:
+                            st.session_state["last_df"] = filtered_df if not filtered_df.empty else df_table
+                    else:
+                        st.session_state["last_df"] = pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"])
+
+                    # Se usuário autenticado, ofereça salvar pesquisa automaticamente
+                    if st.session_state.get("user_logged_in") and st.session_state.get("user_info"):
+                        try:
+                            user = st.session_state["user_info"]
+                            params = {
+                                "area": area, "competence": competence, "location": location,
+                                "free_text": free_text, "linkedin_only": linkedin_only,
+                                "per_page": per_page, "page_idx": page_idx, "engine": engine, "domain": domain, "gl": gl, "hl": hl
+                            }
+                            # não salvar automaticamente sem consentimento: mostrar botão para salvar
+                            # (aqui apenas deixamos disponível o botão abaixo)
+                        except Exception:
+                            pass
+
+    # --- Seção de COLAR/FAZER UPLOAD JSON (opcional) ---
+    if SHOW_JSON_SECTION:
+        st.markdown("---")
+        st.subheader("Ou: cole / carregue um JSON retornado pela API (opcional)")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            pasted = st.text_area("Cole o JSON aqui (opcional)", height=140, placeholder='Cole aqui o JSON retornado pela API...', key="pasted_json")
+        with col2:
+            upload = st.file_uploader("Ou faça upload do arquivo JSON", type=["json"], key="upload_json")
+
+        if st.button("🔧 Montar tabela a partir do JSON colado/subido", key="montar_json_btn"):
+            content = None
+            if upload is not None:
+                try:
+                    raw = upload.read()
+                    content = raw.decode("utf-8")
+                except Exception as e:
+                    st.error(f"Erro lendo arquivo: {e}")
+            elif pasted and pasted.strip():
+                content = pasted.strip()
+            if content:
+                df_table, err = resp_to_table(content, max_rows=per_page)
+                if err:
+                    st.warning(err)
+                st.session_state["last_df"] = df_table
+                parsed, jerr = safe_json_load(content)
+                if parsed:
+                    st.session_state["last_resp"] = parsed
+            else:
+                st.info("Nenhum JSON fornecido para montar a tabela.")
+    # ---------------------------------------------------------------------
+
+    # ----- Mostrar resultados estruturados (da última resposta / upload) -----
     st.markdown("---")
-    st.header("🔍 Consulta no banco — Filtrar por Localização e Competência")
-    st.markdown("Preencha um ou ambos os campos. A busca fará LIKE (case-insensitive) sobre o campo `Local e descrição`.")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        consulta_location = st.text_input("Localização (ex.: São Paulo, Campinas, Brasil)", value="", key="consulta_location_input")
-    with col_b:
-        consulta_competence = st.text_input("Competência (ex.: Python, AWS, DevOps)", value="", key="consulta_competence_input")
-    consulta_cols = st.columns([1,1,1])
-    with consulta_cols[0]:
-        if st.button("🔎 Buscar", key="consulta_buscar_btn"):
-            try:
-                df_res = query_profiles(_conn_for_app, location=consulta_location, competence=consulta_competence)
-                if df_res.empty:
-                    st.info("Nenhum registro encontrado para os critérios fornecidos.")
-                else:
-                    st.success(f"Encontrados {len(df_res)} registros.")
-                    st.dataframe(df_res, use_container_width=True)
-                    csv_r = df_res.to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ Exportar CSV (consulta)", csv_r, file_name="consulta_sourcing_profiles.csv", mime="text/csv", key="download_consulta_btn")
-            except Exception as e:
-                st.error(f"Erro na consulta: {e}")
-    with consulta_cols[1]:
-        if st.button("🧾 Mostrar todos", key="consulta_mostrar_todos_btn"):
-            try:
-                df_all = fetch_all_profiles(_conn_for_app)
-                if df_all.empty:
-                    st.info("Nenhum registro cadastrado.")
-                else:
-                    st.dataframe(df_all, use_container_width=True)
-                    csv_all = df_all.to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ Exportar CSV (todos)", csv_all, file_name="all_sourcing_profiles.csv", mime="text/csv", key="download_all_btn")
-            except Exception as e:
-                st.error(f"Erro ao carregar todos: {e}")
-    with consulta_cols[2]:
-        if st.button("✖ Fechar / Voltar", key="consulta_fechar_btn"):
-            st.session_state["consulta_open"] = False
-            st.experimental_rerun()
+    df_table = st.session_state.get("last_df", pd.DataFrame(columns=["nome", "Link de perfil", "Local e descrição"]))
+    count = int(df_table.shape[0]) if hasattr(df_table, "shape") else 0
+    st.markdown(f"### Resultados estruturados — {count} registros (mostrando até {per_page})")
 
-if show_raw:
-    resp_obj = st.session_state.get("last_resp")
-    if resp_obj is None:
-        st.info("Sem resposta em cache para exibir.")
+    if count == 0:
+        st.info("Nenhum registro extraído para a tabela após limpeza heurística.")
     else:
-        with st.expander("🔧 JSON cru (data retornada pela API) — expandir para inspecionar"):
+        display_df = df_table[["nome", "Link de perfil", "Local e descrição"]].copy()
+        display_df["Local e descrição"] = display_df["Local e descrição"].astype(str).str.replace("\n", " ").str.slice(0, 500)
+        st.dataframe(display_df, use_container_width=True)
+
+        # export columns (apenas admins podem exportar DB completo)
+        user_role = st.session_state.get("user_info", {}).get("role") if st.session_state.get("user_logged_in") else None
+        export_col1, export_col2 = st.columns([1,1])
+
+        with export_col1:
+            # Exportar CSV do DB: somente admin
+            if user_role == "admin":
+                if st.button("⬇️ Exportar CSV (DB — todos perfis)", key="export_db_csv_btn"):
+                    try:
+                        df_db = fetch_all_profiles(_conn_for_app)
+                        if df_db.empty:
+                            st.info("Banco vazio — nada para exportar.")
+                        else:
+                            csv_bytes = df_db.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                "Clique para baixar CSV (DB)",
+                                data=csv_bytes,
+                                file_name="sourcing_profiles_db.csv",
+                                mime="text/csv",
+                                key="download_db_csv_btn"
+                            )
+                    except Exception as e:
+                        st.error(f"Falha ao exportar CSV do DB: {e}")
+            else:
+                st.markdown("**Exportar CSV (DB)** — disponível apenas para admin.")
+
+        with export_col2:
+            # Exportar XLSX do DB: somente admin
+            if user_role == "admin":
+                if st.button("⬇️ Exportar XLSX (DB — todos perfis)", key="export_db_xlsx_btn"):
+                    try:
+                        df_db = fetch_all_profiles(_conn_for_app)
+                        if df_db.empty:
+                            st.info("Banco vazio — nada para exportar.")
+                        else:
+                            out = io.BytesIO()
+                            with pd.ExcelWriter(out, engine="openpyxl") as xw:
+                                df_db.to_excel(xw, sheet_name="Perfis", index=False)
+                            out.seek(0)
+                            st.download_button(
+                                "Clique para baixar XLSX (DB)",
+                                data=out.getvalue(),
+                                file_name="sourcing_profiles_db.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="download_db_xlsx_btn"
+                            )
+                    except Exception as e:
+                        st.error(f"Falha ao exportar XLSX do DB: {e}\n(Verifique se openpyxl está instalado: pip install openpyxl)")
+            else:
+                st.markdown("**Exportar XLSX (DB)** — disponível apenas para admin.")
+
+        # botões de ação: cadastrar no DB (permitido apenas para usuários logados)
+        btn_col1, btn_col2 = st.columns([1,1])
+        with btn_col1:
+            if st.button("✅ Cadastrar (salvar no DB)", key="cadastrar_db_btn"):
+                if not st.session_state.get("user_logged_in"):
+                    st.error("Você precisa estar logado para cadastrar perfis no DB.")
+                else:
+                    try:
+                        conn = _conn_for_app
+                        inserted, ignored = save_profiles_to_db(df_table, conn)
+                        st.success(f"Registros salvos: {inserted}. Ignorados (duplicados): {ignored}.")
+                    except Exception as e:
+                        st.error(f"Erro ao salvar no DB: {e}")
+        with btn_col2:
+            # botão para salvar a pesquisa (parâmetros + resultado) para o usuário autenticado
+            if st.button("💾 Salvar pesquisa atual", key="save_search_btn"):
+                if not st.session_state.get("user_logged_in") or not st.session_state.get("user_info"):
+                    st.error("Faça login para salvar pesquisas.")
+                else:
+                    user = st.session_state["user_info"]
+                    title = st.text_input("Título para salvar a pesquisa (apenas para confirmação)", value=f"Pesquisa {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}", key="save_title")
+                    params = {
+                        "area": area, "competence": competence, "location": location,
+                        "free_text": free_text, "linkedin_only": linkedin_only,
+                        "per_page": per_page, "page_idx": page_idx, "engine": engine, "domain": domain, "gl": gl, "hl": hl
+                    }
+                    try:
+                        save_search_for_user(user["id"], title or f"Pesquisa {datetime.utcnow().isoformat()}", params, result_df=display_df)
+                        st.success("Pesquisa salva para seu usuário.")
+                    except Exception as e:
+                        st.error(f"Falha ao salvar pesquisa: {e}")
+
+    if count > 0:
+        st.markdown("### Links (clique para abrir)")
+        for _, r in df_table.head(per_page).iterrows():
+            nome = r.get("nome") or "(sem nome)"
+            link = r.get("Link de perfil") or ""
+            local_desc = (r.get("Local e descrição") or "")[:200]
+            if link:
+                st.write(f"- [{nome}]({link}) — {local_desc}")
+            else:
+                st.write(f"- {nome} — {local_desc}")
+
+    # painel: visualizar registros já cadastrados no banco (com botão Consulta)
+    st.markdown("---")
+    st.subheader("📚 Registros cadastrados no banco")
+    btns = st.columns([1,1,1])
+    with btns[0]:
+        # Carregar registros do DB: only admin sees full dataframe inline, others get limited message and can request via consulta
+        if st.button("Carregar registros do DB", key="carregar_db_btn"):
             try:
-                pretty = json.dumps(resp_obj, ensure_ascii=False, indent=2)
-            except Exception:
-                pretty = str(resp_obj)
-            st.code(pretty[:20000], language="json")
+                if st.session_state.get("user_logged_in") and st.session_state.get("user_info", {}).get("role") == "admin":
+                    df_db = fetch_all_profiles(_conn_for_app)
+                    if df_db.empty:
+                        st.info("Nenhum registro cadastrado ainda.")
+                    else:
+                        st.dataframe(df_db, use_container_width=True)
+                        csv_db = df_db.to_csv(index=False).encode("utf-8")
+                        st.download_button("⬇️ Exportar CSV (DB)", csv_db, file_name="sourcing_profiles_db.csv", mime="text/csv", key="download_db_btn_panel")
+                else:
+                    st.info("Carregar todos os registros é permitido apenas para admin. Use a área de 'Consulta' para buscar por local/competência.")
+            except Exception as e:
+                st.error(f"Erro ao ler DB: {e}")
+    with btns[1]:
+        if st.button("🔎 Consulta", key="open_consulta_btn"):
+            st.session_state["consulta_open"] = True
+    with btns[2]:
+        # Acesso ao painel de pesquisas salvas (usuário) / admin pode ver todas as pesquisas
+        if st.button("🔖 Minhas pesquisas", key="my_searches_btn"):
+            if not st.session_state.get("user_logged_in"):
+                st.info("Faça login para ver suas pesquisas salvas.")
+            else:
+                user = st.session_state["user_info"]
+                if user["role"] == "admin":
+                    # Admin: listar todas pesquisas (com usuário)
+                    cur = _conn_for_app.cursor()
+                    cur.execute("""SELECT s.id, u.username, s.title, s.params_json, s.created_at
+                                   FROM saved_searches s JOIN users u ON s.user_id = u.id
+                                   ORDER BY s.id DESC LIMIT 200""")
+                    rows = cur.fetchall()
+                    if not rows:
+                        st.info("Nenhuma pesquisa salva no sistema.")
+                    else:
+                        for r in rows:
+                            sid, username, title, params_json, created_at = r
+                            st.markdown(f"- **{title}** — por **{username}** em {created_at}")
+                            with st.expander("Parâmetros"):
+                                try:
+                                    st.json(json.loads(params_json))
+                                except Exception:
+                                    st.text(params_json)
+                else:
+                    # user: list own searches
+                    searches = get_saved_searches_for_user(user["id"])
+                    if not searches:
+                        st.info("Você ainda não salvou pesquisas.")
+                    else:
+                        for s in searches:
+                            cols = st.columns([4,1,1])
+                            cols[0].markdown(f"**{s['title']}** — {s['created_at']}")
+                            if cols[1].button("Executar", key=f"run_{s['id']}"):
+                                params = s["params"]
+                                st.session_state['area_sel'] = params.get("area", "Outro")
+                                st.session_state['competence_input'] = params.get("competence", "")
+                                st.session_state['location_input'] = params.get("location", "")
+                                st.session_state['free_text_input'] = params.get("free_text", "")
+                                st.session_state['linkedin_only_cb'] = params.get("linkedin_only", False)
+                                st.session_state['per_page_slider'] = params.get("per_page", 10)
+                                st.session_state['page_idx_num'] = params.get("page_idx", 0)
+                                st.experimental_rerun()
+                            if cols[2].button("Excluir", key=f"del_{s['id']}"):
+                                ok = delete_saved_search(s['id'], user["id"])
+                                if ok:
+                                    st.success("Pesquisa excluída.")
+                                else:
+                                    st.error("Falha ao excluir (verifique permissões).")
+
+    if st.session_state.get("consulta_open", False):
+        st.markdown("---")
+        st.header("🔍 Consulta no banco — Filtrar por Localização e Competência")
+        st.markdown("Preencha um ou ambos os campos. A busca fará LIKE (case-insensitive) sobre o campo `Local e descrição`.")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            consulta_location = st.text_input("Localização (ex.: São Paulo, Campinas, Brasil)", value="", key="consulta_location_input")
+        with col_b:
+            consulta_competence = st.text_input("Competência (ex.: Python, AWS, DevOps)", value="", key="consulta_competence_input")
+        consulta_cols = st.columns([1,1,1])
+        with consulta_cols[0]:
+            if st.button("🔎 Buscar", key="consulta_buscar_btn"):
+                try:
+                    df_res = query_profiles(_conn_for_app, location=consulta_location, competence=consulta_competence)
+                    if df_res.empty:
+                        st.info("Nenhum registro encontrado para os critérios fornecidos.")
+                    else:
+                        st.success(f"Encontrados {len(df_res)} registros.")
+                        st.dataframe(df_res, use_container_width=True)
+                        csv_r = df_res.to_csv(index=False).encode("utf-8")
+                        st.download_button("⬇️ Exportar CSV (consulta)", csv_r, file_name="consulta_sourcing_profiles.csv", mime="text/csv", key="download_consulta_btn")
+                except Exception as e:
+                    st.error(f"Erro na consulta: {e}")
+        with consulta_cols[1]:
+            if st.button("🧾 Mostrar todos", key="consulta_mostrar_todos_btn"):
+                try:
+                    if st.session_state.get("user_logged_in") and st.session_state.get("user_info", {}).get("role") == "admin":
+                        df_all = fetch_all_profiles(_conn_for_app)
+                        if df_all.empty:
+                            st.info("Nenhum registro cadastrado.")
+                        else:
+                            st.dataframe(df_all, use_container_width=True)
+                            csv_all = df_all.to_csv(index=False).encode("utf-8")
+                            st.download_button("⬇️ Exportar CSV (todos)", csv_all, file_name="all_sourcing_profiles.csv", mime="text/csv", key="download_all_btn")
+                    else:
+                        st.info("Mostrar todos é permitido apenas para admin. Use critérios de consulta para limitar os resultados.")
+                except Exception as e:
+                    st.error(f"Erro ao carregar todos: {e}")
+        with consulta_cols[2]:
+            if st.button("✖ Fechar / Voltar", key="consulta_fechar_btn"):
+                st.session_state["consulta_open"] = False
+                st.experimental_rerun()
+
+    if show_raw:
+        resp_obj = st.session_state.get("last_resp")
+        if resp_obj is None:
+            st.info("Sem resposta em cache para exibir.")
+        else:
+            with st.expander("🔧 JSON cru (data retornada pela API) — expandir para inspecionar"):
+                try:
+                    pretty = json.dumps(resp_obj, ensure_ascii=False, indent=2)
+                except Exception:
+                    pretty = str(resp_obj)
+                st.code(pretty[:20000], language="json")
 
 st.markdown("---")
 st.markdown(
