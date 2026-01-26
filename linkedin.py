@@ -3,8 +3,9 @@
 """
 Pesquisa de Perfis - Linkedin · Thordata SERP — integrado (consulta -> tabela)
 Atualizado: adicionado gerenciamento de usuários (registro/login/logout),
-hashing de senhas (PBKDF2), e armazenamento de pesquisas salvas por usuário.
-Também: bloqueia acesso ao formulário/principal quando usuário não autenticado.
+hashing de senhas (PBKDF2), armazenamento de pesquisas salvas por usuário,
+bloqueio de acesso quando não autenticado, e painel admin para reset de senhas
+(padrão: Cogna2026) com exigência de troca no próximo login.
 """
 import os
 import time
@@ -158,6 +159,17 @@ def init_db():
 
 _conn_for_app = init_db()
 
+# Ensure must_change_password column exists for users (backwards compat)
+def ensure_must_change_column(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(users)")
+    cols = [r[1] for r in cur.fetchall()]
+    if "must_change_password" not in cols:
+        with conn:
+            cur.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+
+ensure_must_change_column(_conn_for_app)
+
 def save_profiles_to_db(df: pd.DataFrame, conn: sqlite3.Connection) -> Tuple[int, int]:
     if df is None or df.empty:
         return 0, 0
@@ -229,11 +241,12 @@ def create_user(username: str, password: str, role: str = "user") -> Tuple[bool,
 
 def get_user_by_username(username: str) -> Optional[Dict[str, Any]]:
     cur = _conn_for_app.cursor()
-    cur.execute("SELECT id, username, password_hash, salt, role, created_at FROM users WHERE username = ?", (username,))
+    # include must_change_password
+    cur.execute("SELECT id, username, password_hash, salt, role, created_at, COALESCE(must_change_password,0) FROM users WHERE username = ?", (username,))
     r = cur.fetchone()
     if not r:
         return None
-    return {"id": r[0], "username": r[1], "password_hash": r[2], "salt": r[3], "role": r[4], "created_at": r[5]}
+    return {"id": r[0], "username": r[1], "password_hash": r[2], "salt": r[3], "role": r[4], "created_at": r[5], "must_change_password": int(r[6])}
 
 def verify_user_credentials(username: str, password: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
     u = get_user_by_username(username)
@@ -251,6 +264,41 @@ def count_users() -> int:
     cur.execute("SELECT COUNT(1) FROM users")
     r = cur.fetchone()
     return int(r[0]) if r else 0
+
+def update_user_password(user_id: int, new_password: str) -> Tuple[bool, str]:
+    """Set new password for user and clear must_change_password flag."""
+    try:
+        salt = os.urandom(_SALT_BYTES)
+        salt_hex = binascii.hexlify(salt).decode("ascii")
+        pw_hash = _derive_hash(new_password, salt)
+        cur = _conn_for_app.cursor()
+        with _conn_for_app:
+            cur.execute("UPDATE users SET password_hash = ?, salt = ?, must_change_password = 0 WHERE id = ?", (pw_hash, salt_hex, user_id))
+        return True, "Senha atualizada com sucesso."
+    except Exception as e:
+        return False, f"Falha ao atualizar senha: {e}"
+
+def reset_user_password_to_default(user_id: int, default_password: str = "Cogna2026") -> Tuple[bool, str]:
+    """Admin function: reset password to default (sets must_change_password=1)."""
+    try:
+        salt = os.urandom(_SALT_BYTES)
+        salt_hex = binascii.hexlify(salt).decode("ascii")
+        pw_hash = _derive_hash(default_password, salt)
+        cur = _conn_for_app.cursor()
+        with _conn_for_app:
+            cur.execute("UPDATE users SET password_hash = ?, salt = ?, must_change_password = 1 WHERE id = ?", (pw_hash, salt_hex, user_id))
+        return True, "Senha resetada para padrão. Usuário precisará criar nova senha no próximo acesso."
+    except Exception as e:
+        return False, f"Falha ao resetar senha: {e}"
+
+def list_users(limit: int = 500) -> List[Dict[str, Any]]:
+    cur = _conn_for_app.cursor()
+    cur.execute("SELECT id, username, role, created_at, COALESCE(must_change_password,0) FROM users ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": r[0], "username": r[1], "role": r[2], "created_at": r[3], "must_change_password": int(r[4])})
+    return out
 
 # ---------------- Saved searches helpers ----------------
 def save_search_for_user(user_id: int, title: str, params: Dict[str, Any], result_df: Optional[pd.DataFrame] = None) -> None:
@@ -608,9 +656,11 @@ if "user_logged_in" not in st.session_state:
     st.session_state["user_logged_in"] = False
 if "user_info" not in st.session_state:
     st.session_state["user_info"] = None
+if "admin_show_users" not in st.session_state:
+    st.session_state["admin_show_users"] = False
 
 # ---------------------------
-# REPLACED login_ui(): show "Registrar" only when:
+# login_ui(): show "Registrar" only when:
 #  - no users exist (bootstrap) OR
 #  - an admin is currently logged in
 # ---------------------------
@@ -638,9 +688,11 @@ def login_ui():
         if st.sidebar.button("Entrar", key="login_btn"):
             ok, user = verify_user_credentials((username or "").strip(), password or "")
             if ok and user:
+                # refresh user from DB (includes must_change_password)
+                fresh = get_user_by_username(user["username"]) or user
                 st.session_state["user_logged_in"] = True
-                st.session_state["user_info"] = user
-                st.success(f"Bem-vindo, {user['username']} ({user['role']})")
+                st.session_state["user_info"] = fresh
+                st.success(f"Bem-vindo, {fresh['username']} ({fresh['role']})")
             else:
                 st.error("Usuário ou senha inválidos.")
 
@@ -675,13 +727,60 @@ def login_ui():
         if not st.session_state.get("user_logged_in"):
             st.sidebar.info("Nenhum usuário autenticado.")
         else:
-            user = st.session_state.get("user_info")
-            st.sidebar.markdown(f"**Usuário:** {user['username']}  \n**Role:** {user['role']}")
+            # refresh user info from DB (get must_change_password, role, etc)
+            user = st.session_state.get("user_info") or {}
+            fresh = get_user_by_username(user.get("username")) or user
+            st.sidebar.markdown(f"**Usuário:** {fresh.get('username')}  \n**Role:** {fresh.get('role')}")
+            # If must_change_password -> force password change now
+            if int(fresh.get("must_change_password", 0)) == 1:
+                st.sidebar.warning("Sua senha foi resetada pelo admin. Você deve informar uma nova senha agora.")
+                new_pwd = st.sidebar.text_input("Nova senha", type="password", key="mustchg_pwd")
+                confirm_pwd = st.sidebar.text_input("Confirme a nova senha", type="password", key="mustchg_pwd2")
+                if st.sidebar.button("Atualizar senha", key="mustchg_btn"):
+                    if not new_pwd or not confirm_pwd:
+                        st.sidebar.error("Informe a nova senha e confirme.")
+                    elif new_pwd != confirm_pwd:
+                        st.sidebar.error("Senhas não conferem.")
+                    else:
+                        ok, msg = update_user_password(fresh["id"], new_pwd)
+                        if ok:
+                            st.sidebar.success(msg)
+                            st.session_state["user_info"] = get_user_by_username(fresh["username"])
+                        else:
+                            st.sidebar.error(msg)
+            # admin-only user management controls (button abaixo do perfil)
+            if fresh.get("role") == "admin":
+                st.sidebar.markdown("---")
+                st.sidebar.markdown("### 🛠️ Administração")
+                if st.sidebar.button("Mostrar usuários cadastrados", key="admin_show_users_btn"):
+                    st.session_state["admin_show_users"] = not st.session_state.get("admin_show_users", False)
+                if st.session_state.get("admin_show_users", False):
+                    st.sidebar.markdown("**Usuários do sistema:**")
+                    users = list_users(limit=500)
+                    if not users:
+                        st.sidebar.info("Nenhum usuário cadastrado.")
+                    else:
+                        for u in users:
+                            cols = st.sidebar.columns([3,1])
+                            label = f"{u['username']} — {u['role']}"
+                            if u.get("must_change_password"):
+                                label += " (senha resetada)"
+                            cols[0].write(label)
+                            # Reset button per user (admin only)
+                            if cols[1].button("Resetar senha", key=f"reset_user_{u['id']}"):
+                                ok,msg = reset_user_password_to_default(u['id'], default_password="Cogna2026")
+                                if ok:
+                                    st.sidebar.success(f"Senha de {u['username']} resetada. Usuário deverá definir nova senha no próximo acesso.")
+                                else:
+                                    st.sidebar.error(msg)
+            # Logout button
             if st.sidebar.button("Sair", key="logout_btn"):
                 st.session_state["user_logged_in"] = False
                 st.session_state["user_info"] = None
+                st.session_state["admin_show_users"] = False
                 st.sidebar.success("Você saiu da sessão.")
 
+# call login ui
 login_ui()
 
 # ---------------- main UI ----------------
