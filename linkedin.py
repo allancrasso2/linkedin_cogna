@@ -6,6 +6,13 @@ Atualizado: adicionado gerenciamento de usuários (registro/login/logout),
 hashing de senhas (PBKDF2), armazenamento de pesquisas salvas por usuário,
 bloqueio de acesso quando não autenticado, e painel admin para reset de senhas
 (padrão: Cogna2026) com exigência de troca no próximo login.
+
+Alterações importantes:
+ - Query de localização envolvida por aspas para aumentar precisão.
+ - Filtragem estrita: se nenhum item corresponder aos filtros (competência/local),
+   resultado final será vazio (não volta ao resultado bruto).
+ - Melhorias na checagem de local (cidade + UF/estado).
+ - Permitir que usuários não-admin carreguem amostra limitada do DB.
 """
 import os
 import time
@@ -519,9 +526,17 @@ def profile_has_competence(item: Dict, competence: str) -> bool:
     return True
 
 def profile_matches_location(item: Dict, location_query: str) -> bool:
+    """
+    More permissive/accurate matching:
+    - If user provided city + state (e.g., 'Campinas/SP'), require the city token(s) be present.
+    - If user provided only state, require state name or abbreviation.
+    - Tokens are considered case-insensitive.
+    """
     if not location_query:
         return True
     tokens = [t.strip().lower() for t in re.split(r"[,\|/]+", location_query) if t.strip()]
+    if not tokens:
+        return True
     loc_candidates = []
     for f in ("location","place","displayed_location","city","region","locale","area"):
         v = item.get(f)
@@ -534,12 +549,45 @@ def profile_matches_location(item: Dict, location_query: str) -> bool:
     if normalized_local:
         loc_candidates.append(normalized_local)
     combined = " ".join(loc_candidates).lower()
+
+    # separate city-like tokens from state-like tokens
+    city_tokens = []
+    state_tokens = []
     for tok in tokens:
-        if tok not in combined:
+        if len(tok) <= 3 and tok.upper() in BRAZIL_STATE_ABBR:
+            state_tokens.append(tok)
+        elif tok in [s.lower() for s in BRAZIL_STATE_NAMES]:
+            state_tokens.append(tok)
+        else:
+            city_tokens.append(tok)
+
+    # If city tokens provided, require they appear (all of them)
+    for ct in city_tokens:
+        if ct not in combined:
             return False
+
+    # If no city tokens but state tokens exist, require at least one state token present
+    if not city_tokens and state_tokens:
+        found_state = False
+        for st in state_tokens:
+            if st in combined:
+                found_state = True
+                break
+            # also check full state name presence
+            if st.lower() in combined:
+                found_state = True
+                break
+        if not found_state:
+            return False
+
+    # If both provided (city + state), city check above suffices; state is optional but helpful.
     return True
 
 def filter_api_results(parsed_resp: Dict, df_table: pd.DataFrame, competence: str, location: str) -> pd.DataFrame:
+    """
+    Given raw parsed_resp (API JSON) and the tabular df_table produced from it,
+    filter rows so that each row's corresponding raw item matches competence & location.
+    """
     if df_table is None or df_table.empty:
         return df_table
     items = find_organic_list(parsed_resp)
@@ -552,6 +600,7 @@ def filter_api_results(parsed_resp: Dict, df_table: pd.DataFrame, competence: st
     for _, r in df_table.iterrows():
         link = (r.get("Link de perfil") or "").strip()
         item = item_by_link.get(link)
+        # try to find item by matching name/snippet if link not found
         if item is None:
             name = (r.get("nome") or "").strip().lower()
             for it in items:
@@ -560,14 +609,18 @@ def filter_api_results(parsed_resp: Dict, df_table: pd.DataFrame, competence: st
                 if name and (name in str(tit).lower() or name in str(sn).lower()):
                     item = it
                     break
+        # If still None, attempt to filter based on the db-supplied 'Local e descrição' text
         if item is None:
             cand_text = (r.get("Local e descrição") or "") + " " + (r.get("nome") or "")
+            # require competence and location tokens in candidate text
             if competence and competence.strip() and competence.strip().lower() not in cand_text.lower():
                 continue
             if location and location.strip() and location.strip().lower() not in cand_text.lower():
                 continue
             kept_rows.append(r)
             continue
+
+        # At this point we have an item (raw API object)
         if not profile_has_competence(item, competence):
             continue
         if not profile_matches_location(item, location):
@@ -861,13 +914,20 @@ else:
         st.session_state["consulta_open"] = False
 
     def build_query(area: str, competence: str, location: str, free_text: str, linkedin_only: bool) -> str:
+        """
+        Build a slightly stricter query:
+         - wrap location in quotes (e.g., "Campinas SP") to bias SERP to that geographic phrase
+         - keep linkedin_only scope if requested
+        """
         parts = []
         if area and area != "Outro":
             parts.append(area)
         if competence:
             parts.append(competence)
         if location:
-            parts.append(location)
+            # normalize separators and quote location to improve SERP relevance
+            loc_norm = location.replace("/", " ").replace(",", " ").strip()
+            parts.append(f'"{loc_norm}"')
         if free_text:
             parts.append(free_text)
         q = " ".join(parts).strip()
@@ -914,7 +974,7 @@ else:
             if not ok:
                 st.error(reason)
             else:
-                # --- NOVA guarda if/else rigorosa ---
+                # --- Guarda rigorosa ---
                 loc_tokens = tokenize_input(location)
                 comp_tokens = tokenize_input(competence)
 
@@ -930,11 +990,9 @@ else:
                 # 4) bloqueia se os dois campos forem identicos (provável erro)
                 fields_identical = location.strip().lower() == competence.strip().lower() and bool(location.strip())
 
-                # If/else: decidir se seguimos com a consulta
                 if loc_has_skill_token:
                     st.error("Bloqueado: o campo 'Localidade' contém tokens que parecem competências (ex.: 'Python', 'Java'). Corrija o campo Localidade.")
                     st.info("Dica: escreva 'Campinas, SP' ou 'Campinas/SP' no campo Localidade.")
-                    # interrompe aqui
                     st.stop()
                 if comp_looks_like_loc:
                     st.error("Bloqueado: o campo 'Competência' parece conter uma localidade (ex.: 'Campinas/SP'). Corrija o campo Competência.")
@@ -942,13 +1000,11 @@ else:
                 if fields_identical:
                     st.error("Bloqueado: os campos 'Localidade' e 'Competência' não podem ser iguais.")
                     st.stop()
-                # Se a localidade não estiver em formato estrito, bloqueia (para evitar buscas por skills no campo Local)
                 if loc_not_strict:
-                    # mas dê uma mensagem clara e orientações
                     st.error("Bloqueado: o campo 'Localidade' não está em formato esperado (ex.: 'Cidade, UF' ou 'Cidade/UF').")
                     st.info("Formate a localidade como 'Campinas, SP' ou 'Campinas/SP' para prosseguir.")
                     st.stop()
-                # --- fim da guarda if/else ---
+                # --- fim da guarda ---
 
                 # se chegamos aqui, os campos parecem consistentes — monta query e faz a chamada
                 q = build_query(area, competence, location, free_text, linkedin_only)
@@ -970,11 +1026,15 @@ else:
                         df_table, err = resp_to_table(resp_obj, max_rows=per_page)
                         if err:
                             st.warning(err)
+                        # filtragem estrita: se nada passar, deixamos resultado vazio (não retornamos ao df_table bruto)
                         filtered_df = filter_api_results(resp_obj, df_table, competence or "", location or "")
                         if filtered_df.empty and (competence or location):
                             st.warning("Nenhum resultado após aplicar validações de Localidade/Competência. Tente relaxar os filtros ou revisar os campos.")
-                            # keep original df_table for inspection (but still warn)
-                            st.session_state["last_df"] = df_table
+                            # mantemos a tabela final vazia (com facilidade para inspecionar os brutos em expander)
+                            st.session_state["last_df"] = filtered_df
+                            if df_table is not None and not df_table.empty:
+                                with st.expander("🔍 Mostrar resultados brutos retornados pela API (não correspondem aos filtros)"):
+                                    st.dataframe(df_table, use_container_width=True)
                         else:
                             st.session_state["last_df"] = filtered_df if not filtered_df.empty else df_table
                     else:
@@ -989,8 +1049,7 @@ else:
                                 "free_text": free_text, "linkedin_only": linkedin_only,
                                 "per_page": per_page, "page_idx": page_idx, "engine": engine, "domain": domain, "gl": gl, "hl": hl
                             }
-                            # não salvar automaticamente sem consentimento: mostrar botão para salvar
-                            # (aqui apenas deixamos disponível o botão abaixo)
+                            # não salvar automaticamente sem consentimento: botão disponível abaixo
                         except Exception:
                             pass
 
@@ -1136,26 +1195,64 @@ else:
     # painel: visualizar registros já cadastrados no banco (com botão Consulta)
     st.markdown("---")
     st.subheader("📚 Registros cadastrados no banco")
+
+    # --- CHANGED ---
+    # Permitir que usuários não-admin carreguem uma amostra limitada do DB.
+    # Admins continuam com acesso completo (visualização + export).
     btns = st.columns([1,1,1])
     with btns[0]:
-        # Carregar registros do DB: only admin sees full dataframe inline, others get limited message and can request via consulta
+        # escolha de limite para usuários não-admin (visível antes do clique)
+        user_role = st.session_state.get("user_info", {}).get("role") if st.session_state.get("user_logged_in") else None
+        if user_role != "admin" and st.session_state.get("user_logged_in"):
+            # permitimos o usuário escolher quantos registros quer trazer (limite para evitar exposição massiva)
+            max_load_for_user = st.number_input(
+                "Quantidade de registros a carregar (usuários) — limite para não-admin",
+                min_value=10, max_value=2000, value=200, step=10, key="user_load_limit"
+            )
+        else:
+            # valor padrão (usado apenas para admin ou se não estiver logado)
+            max_load_for_user = st.session_state.get("user_load_limit", 200)
+
         if st.button("Carregar registros do DB", key="carregar_db_btn"):
             try:
-                if st.session_state.get("user_logged_in") and st.session_state.get("user_info", {}).get("role") == "admin":
-                    df_db = fetch_all_profiles(_conn_for_app)
-                    if df_db.empty:
-                        st.info("Nenhum registro cadastrado ainda.")
-                    else:
-                        st.dataframe(df_db, use_container_width=True)
-                        csv_db = df_db.to_csv(index=False).encode("utf-8")
-                        st.download_button("⬇️ Exportar CSV (DB)", csv_db, file_name="sourcing_profiles_db.csv", mime="text/csv", key="download_db_btn_panel")
+                if not st.session_state.get("user_logged_in"):
+                    st.info("Faça login para carregar registros do banco.")
                 else:
-                    st.info("Carregar todos os registros é permitido apenas para admin. Use a área de 'Consulta' para buscar por local/competência.")
+                    if user_role == "admin":
+                        # admin: comportamento anterior — carregar tudo e permitir exportar
+                        df_db = fetch_all_profiles(_conn_for_app)
+                        if df_db.empty:
+                            st.info("Nenhum registro cadastrado ainda.")
+                        else:
+                            st.dataframe(df_db, use_container_width=True)
+                            csv_db = df_db.to_csv(index=False).encode("utf-8")
+                            st.download_button("⬇️ Exportar CSV (DB)", csv_db, file_name="sourcing_profiles_db.csv", mime="text/csv", key="download_db_btn_panel")
+                    else:
+                        # não-admin: carregar apenas os últimos N registros (por default 200)
+                        df_db_full = fetch_all_profiles(_conn_for_app)
+                        if df_db_full.empty:
+                            st.info("Nenhum registro cadastrado ainda.")
+                        else:
+                            df_db = df_db_full.head(int(max_load_for_user))
+                            st.success(f"Mostrando os últimos {len(df_db)} registros (limite aplicado para seu perfil).")
+                            st.dataframe(df_db, use_container_width=True)
+                            # Permitir download apenas da amostra exibida (não do DB completo)
+                            csv_db = df_db.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                "⬇️ Exportar CSV (amostra limitada)",
+                                csv_db,
+                                file_name=f"sourcing_profiles_db_limited_{len(df_db)}.csv",
+                                mime="text/csv",
+                                key="download_db_limited_btn"
+                            )
+                            st.info("Exportação restrita: apenas os registros exibidos acima estão disponíveis para download. Para exportar o DB completo, solicite um administrador.")
             except Exception as e:
                 st.error(f"Erro ao ler DB: {e}")
+
     with btns[1]:
         if st.button("🔎 Consulta", key="open_consulta_btn"):
             st.session_state["consulta_open"] = True
+
     with btns[2]:
         # Acesso ao painel de pesquisas salvas (usuário) / admin pode ver todas as pesquisas
         if st.button("🔖 Minhas pesquisas", key="my_searches_btn"):
@@ -1206,6 +1303,7 @@ else:
                                     st.success("Pesquisa excluída.")
                                 else:
                                     st.error("Falha ao excluir (verifique permissões).")
+    # --- CHANGED ---
 
     if st.session_state.get("consulta_open", False):
         st.markdown("---")
