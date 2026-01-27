@@ -13,6 +13,7 @@ Alterações importantes:
    resultado final será vazio (não volta ao resultado bruto).
  - Melhorias na checagem de local (cidade + UF/estado).
  - Permitir que usuários não-admin carreguem amostra limitada do DB.
+ - TODOS os botões "Exportar CSV" alterados para exportar XLSX conforme solicitado.
 """
 import os
 import time
@@ -704,6 +705,18 @@ if not THORDATA_TOKEN:
 if not THORDATA_TOKEN:
     THORDATA_TOKEN = os.getenv("THORDATA_TOKEN", "").strip()
 
+# ---------------- Helper: convert DataFrame -> XLSX bytes ----------------
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Perfis") -> bytes:
+    out = io.BytesIO()
+    try:
+        # use openpyxl engine (pandas will require openpyxl installed)
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+        out.seek(0)
+        return out.getvalue()
+    except Exception as e:
+        raise RuntimeError(f"Falha ao gerar XLSX: {e}")
+
 # ---------------- UI / Auth UI ----------------
 if "user_logged_in" not in st.session_state:
     st.session_state["user_logged_in"] = False
@@ -1103,31 +1116,32 @@ else:
         export_col1, export_col2 = st.columns([1,1])
 
         with export_col1:
-            # Exportar CSV do DB: somente admin
+            # Exportar XLSX do DB: somente admin (alterado para XLSX)
             if user_role == "admin":
-                if st.button("⬇️ Exportar CSV (DB — todos perfis)", key="export_db_csv_btn"):
+                if st.button("⬇️ Exportar XLSX (DB — todos perfis)", key="export_db_xlsx_btn_top"):
                     try:
                         df_db = fetch_all_profiles(_conn_for_app)
                         if df_db.empty:
                             st.info("Banco vazio — nada para exportar.")
                         else:
-                            csv_bytes = df_db.to_csv(index=False).encode("utf-8")
+                            xlsx_bytes = df_to_xlsx_bytes(df_db, sheet_name="Perfis")
                             st.download_button(
-                                "Clique para baixar CSV (DB)",
-                                data=csv_bytes,
-                                file_name="sourcing_profiles_db.csv",
-                                mime="text/csv",
-                                key="download_db_csv_btn"
+                                "Clique para baixar XLSX (DB)",
+                                data=xlsx_bytes,
+                                file_name="sourcing_profiles_db.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="download_db_xlsx_btn_top"
                             )
                     except Exception as e:
-                        st.error(f"Falha ao exportar CSV do DB: {e}")
+                        st.error(f"Falha ao exportar XLSX do DB: {e}\n(Verifique se openpyxl está instalado: pip install openpyxl)")
+
             else:
-                st.markdown("**Exportar CSV (DB)** — disponível apenas para admin.")
+                st.markdown("**Exportar XLSX (DB)** — disponível apenas para admin.")
 
         with export_col2:
-            # Exportar XLSX do DB: somente admin
+            # Exportar XLSX do DB: somente admin (mantém opção original, label único)
             if user_role == "admin":
-                if st.button("⬇️ Exportar XLSX (DB — todos perfis)", key="export_db_xlsx_btn"):
+                if st.button("⬇️ Exportar XLSX (DB — todos perfis)  (alternativo)", key="export_db_xlsx_btn"):
                     try:
                         df_db = fetch_all_profiles(_conn_for_app)
                         if df_db.empty:
@@ -1142,7 +1156,7 @@ else:
                                 data=out.getvalue(),
                                 file_name="sourcing_profiles_db.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key="download_db_xlsx_btn"
+                                key="download_db_xlsx_btn2"
                             )
                     except Exception as e:
                         st.error(f"Falha ao exportar XLSX do DB: {e}\n(Verifique se openpyxl está instalado: pip install openpyxl)")
@@ -1219,14 +1233,17 @@ else:
                     st.info("Faça login para carregar registros do banco.")
                 else:
                     if user_role == "admin":
-                        # admin: comportamento anterior — carregar tudo e permitir exportar
+                        # admin: comportamento anterior — carregar tudo e permitir exportar (agora em XLSX)
                         df_db = fetch_all_profiles(_conn_for_app)
                         if df_db.empty:
                             st.info("Nenhum registro cadastrado ainda.")
                         else:
                             st.dataframe(df_db, use_container_width=True)
-                            csv_db = df_db.to_csv(index=False).encode("utf-8")
-                            st.download_button("⬇️ Exportar CSV (DB)", csv_db, file_name="sourcing_profiles_db.csv", mime="text/csv", key="download_db_btn_panel")
+                            try:
+                                xlsx_db = df_to_xlsx_bytes(df_db, sheet_name="Perfis")
+                                st.download_button("⬇️ Exportar XLSX (DB)", xlsx_db, file_name="sourcing_profiles_db.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_db_btn_panel")
+                            except Exception as e:
+                                st.error(f"Falha ao gerar XLSX para download: {e}\n(Instale openpyxl: pip install openpyxl)")
                     else:
                         # não-admin: carregar apenas os últimos N registros (por default 200)
                         df_db_full = fetch_all_profiles(_conn_for_app)
@@ -1236,15 +1253,18 @@ else:
                             df_db = df_db_full.head(int(max_load_for_user))
                             st.success(f"Mostrando os últimos {len(df_db)} registros (limite aplicado para seu perfil).")
                             st.dataframe(df_db, use_container_width=True)
-                            # Permitir download apenas da amostra exibida (não do DB completo)
-                            csv_db = df_db.to_csv(index=False).encode("utf-8")
-                            st.download_button(
-                                "⬇️ Exportar CSV (amostra limitada)",
-                                csv_db,
-                                file_name=f"sourcing_profiles_db_limited_{len(df_db)}.csv",
-                                mime="text/csv",
-                                key="download_db_limited_btn"
-                            )
+                            # Permitir download apenas da amostra exibida (não do DB completo) — agora em XLSX
+                            try:
+                                xlsx_db_sample = df_to_xlsx_bytes(df_db, sheet_name="Amostra")
+                                st.download_button(
+                                    "⬇️ Exportar XLSX (amostra limitada)",
+                                    xlsx_db_sample,
+                                    file_name=f"sourcing_profiles_db_limited_{len(df_db)}.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key="download_db_limited_btn"
+                                )
+                            except Exception as e:
+                                st.error(f"Falha ao gerar XLSX para download: {e}\n(Instale openpyxl: pip install openpyxl)")
                             st.info("Exportação restrita: apenas os registros exibidos acima estão disponíveis para download. Para exportar o DB completo, solicite um administrador.")
             except Exception as e:
                 st.error(f"Erro ao ler DB: {e}")
@@ -1324,8 +1344,12 @@ else:
                     else:
                         st.success(f"Encontrados {len(df_res)} registros.")
                         st.dataframe(df_res, use_container_width=True)
-                        csv_r = df_res.to_csv(index=False).encode("utf-8")
-                        st.download_button("⬇️ Exportar CSV (consulta)", csv_r, file_name="consulta_sourcing_profiles.csv", mime="text/csv", key="download_consulta_btn")
+                        # export as XLSX instead of CSV
+                        try:
+                            xlsx_consulta = df_to_xlsx_bytes(df_res, sheet_name="Consulta")
+                            st.download_button("⬇️ Exportar XLSX (consulta)", xlsx_consulta, file_name="consulta_sourcing_profiles.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_consulta_btn")
+                        except Exception as e:
+                            st.error(f"Falha ao gerar XLSX para download: {e}\n(Instale openpyxl: pip install openpyxl)")
                 except Exception as e:
                     st.error(f"Erro na consulta: {e}")
         with consulta_cols[1]:
@@ -1337,8 +1361,11 @@ else:
                             st.info("Nenhum registro cadastrado.")
                         else:
                             st.dataframe(df_all, use_container_width=True)
-                            csv_all = df_all.to_csv(index=False).encode("utf-8")
-                            st.download_button("⬇️ Exportar CSV (todos)", csv_all, file_name="all_sourcing_profiles.csv", mime="text/csv", key="download_all_btn")
+                            try:
+                                xlsx_all = df_to_xlsx_bytes(df_all, sheet_name="Todos")
+                                st.download_button("⬇️ Exportar XLSX (todos)", xlsx_all, file_name="all_sourcing_profiles.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="download_all_btn")
+                            except Exception as e:
+                                st.error(f"Falha ao gerar XLSX para download: {e}\n(Instale openpyxl: pip install openpyxl)")
                     else:
                         st.info("Mostrar todos é permitido apenas para admin. Use critérios de consulta para limitar os resultados.")
                 except Exception as e:
